@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Data and models
+data/
+pretrained_model/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Logs
+lightning_logs/
+wandb/
+
+# Test files
+test_images/
+
+# OS
+.DS_Store
+Thumbs.db
