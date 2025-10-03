@@ -134,7 +134,7 @@ class LitDenoiser(pl.LightningModule):
                 n_iters_intra=n_iters_intra
             )
         elif model_arch == "recur_new":
-            print("RecurrentConvNLayer2")
+            print(eta_ls)
             self.model = RecurrentConvNLayer2(
                 in_channels=in_channels,
                 num_basis=num_basis,
@@ -158,17 +158,35 @@ class LitDenoiser(pl.LightningModule):
                 # whiten_dim=16,
             )
         print(type(self.model))
-        # Initialize EMA model as a copy of the main model
-        self.ema_model = type(self.model)(
-            in_channels=in_channels,
-            num_basis=num_basis,
-            eta_base=eta_base,
-            n_iters_inter=n_iters_inter,
-            kernel_size=kernel_size,
-            stride=stride,
-            n_iters_intra=n_iters_intra,
-            # whiten_dim=16,
-        )
+        # Initialize EMA model mirroring the selected architecture
+        if model_arch == "unet":
+            self.ema_model = UNetBlind64(
+                in_channels=in_channels,
+                num_basis=num_basis,
+                eta_base=eta_base,
+                n_iters_inter=n_iters_inter,
+                kernel_size=kernel_size,
+                stride=stride,
+                n_iters_intra=n_iters_intra,
+            )
+        elif model_arch == "recur_new":
+            self.ema_model = RecurrentConvNLayer2(
+                in_channels=in_channels,
+                num_basis=num_basis,
+                kernel_size=kernel_size,
+                stride=stride,
+                eta_ls=eta_ls,
+            )
+        else:
+            self.ema_model = RecurrentConvNLayer(
+                in_channels=in_channels,
+                num_basis=num_basis,
+                eta_base=eta_base,
+                n_iters_inter=n_iters_inter,
+                kernel_size=kernel_size,
+                stride=stride,
+                n_iters_intra=n_iters_intra,
+            )
         # Copy initial parameters from main model to EMA model
         self.ema_model.load_state_dict(self.model.state_dict())
         # Freeze EMA model parameters (they will be updated via EMA, not gradients)
@@ -432,7 +450,7 @@ if __name__ == "__main__":
     # Prepare data and model
     # dm = MNISTDataModule(batch_size=args.batch_size)
     lr = args.lr*args.batch_size/64*args.gpus
-
+    print(args.eta_ls)
     model = LitDenoiser(
         in_channels=args.in_channels,
         num_basis=args.num_basis,
@@ -448,7 +466,8 @@ if __name__ == "__main__":
         model_arch = args.model_arch,
         P_mean=args.P_mean,
         P_std=args.P_std,
-        edm_weighting = args.edm_weighting
+        edm_weighting = args.edm_weighting,
+        eta_ls=args.eta_ls
     )
     
     # Load checkpoint if specified

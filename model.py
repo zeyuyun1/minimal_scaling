@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import math
 import random
 
 
@@ -391,7 +392,7 @@ class RecurrentConvNLayer(nn.Module):
 
 class RecurrentConvNLayer2(nn.Module):
     def __init__(self, in_channels, num_basis,
-                 n_iters_inter=1, n_iters_intra=1,
+                 n_iters_inter=1, n_iters_intra=1,eta_base=0.1,
                  kernel_size=5, stride=2, output_padding=1, whiten_dim=None,
                  # NEW: JFB controls
                  jfb_no_grad_iters=(0, 6),       # n in [0, N]
@@ -403,11 +404,16 @@ class RecurrentConvNLayer2(nn.Module):
         self.n_levels = len(num_basis)
         self.n_iters_inter = n_iters_inter           # keep as 1 for DEQ
         self.n_iters_intra = n_iters_intra
-        if eta_ls is not None:
-            self.eta_ls = [0.1]*len(num_basis)
-        else :
-            self.eta_ls = eta_ls
+        self.eta_base = eta_base
+        # Default eta list if not provided; validate length
+        if eta_ls is None:
+            self.eta_ls = [float(eta_base)] * self.n_levels
+        else:
+            if len(eta_ls) != self.n_levels:
+                raise ValueError(f"eta_ls length {len(eta_ls)} must match number of levels {self.n_levels}")
+            self.eta_ls = [float(x) for x in eta_ls]
         # self.eta = eta_base / max(1, n_iters_intra)  # decouple from inter iters
+        # print(self.eta_ls)
 
         self.jfb_no_grad_iters = jfb_no_grad_iters
         self.jfb_with_grad_iters = jfb_with_grad_iters
