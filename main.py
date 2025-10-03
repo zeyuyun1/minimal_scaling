@@ -112,7 +112,8 @@ class LitDenoiser(pl.LightningModule):
         ema_rampup_ratio: float = 0.05,
         P_mean: float = -2.0,
         P_std: float = 0.5,
-        edm_weighting: bool = False
+        edm_weighting: bool = False,
+        eta_ls: list = None,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -133,13 +134,15 @@ class LitDenoiser(pl.LightningModule):
                 n_iters_intra=n_iters_intra
             )
         elif model_arch == "recur_new":
+            print("RecurrentConvNLayer2")
             self.model = RecurrentConvNLayer2(
                 in_channels=in_channels,
                 num_basis=num_basis,
-                eta_base=eta_base,
+                # eta_base=eta_base,
                 # n_iters_inter=n_iters_inter,
                 kernel_size=kernel_size,
                 stride=stride,
+                eta_ls=eta_ls,
                 # n_iters_intra=n_iters_intra,
                 # whiten_dim=16,
             )
@@ -154,7 +157,7 @@ class LitDenoiser(pl.LightningModule):
                 n_iters_intra=n_iters_intra,
                 # whiten_dim=16,
             )
-        
+        print(type(self.model))
         # Initialize EMA model as a copy of the main model
         self.ema_model = type(self.model)(
             in_channels=in_channels,
@@ -362,7 +365,8 @@ if __name__ == "__main__":
                         help="EMA ramp-up ratio (default: 0.05)")
     parser.add_argument("--checkpoint_path", type=str, default=None,
                         help="Path to checkpoint file to load for initialization (e.g., 'pretrained_model/main/00001_experiment/denoiser.ckpt')")
-
+    parser.add_argument("--eta_ls", type=lambda s: [float(item) for item in s.split(',')], default=None,
+                        help="Comma-separated list for step size for each layer, e.g. '0.1,0.1'.")
     args = parser.parse_args()
     
     # Set up experiment directory with index to avoid collisions

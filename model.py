@@ -390,19 +390,24 @@ class RecurrentConvNLayer(nn.Module):
 
 
 class RecurrentConvNLayer2(nn.Module):
-    def __init__(self, in_channels, num_basis, eta_base=None,
+    def __init__(self, in_channels, num_basis,
                  n_iters_inter=1, n_iters_intra=1,
                  kernel_size=5, stride=2, output_padding=1, whiten_dim=None,
                  # NEW: JFB controls
                  jfb_no_grad_iters=(0, 6),       # n in [0, N]
                  jfb_with_grad_iters=(1, 3),     # m in [1, M]
                  jfb_reuse_solution=False,
-                 jfb_ddp_safe=True):
+                 jfb_ddp_safe=True,
+                 eta_ls = None):
         super().__init__()
         self.n_levels = len(num_basis)
         self.n_iters_inter = n_iters_inter           # keep as 1 for DEQ
         self.n_iters_intra = n_iters_intra
-        self.eta = eta_base / max(1, n_iters_intra)  # decouple from inter iters
+        if eta_ls is not None:
+            self.eta_ls = [0.1]*len(num_basis)
+        else :
+            self.eta_ls = eta_ls
+        # self.eta = eta_base / max(1, n_iters_intra)  # decouple from inter iters
 
         self.jfb_no_grad_iters = jfb_no_grad_iters
         self.jfb_with_grad_iters = jfb_with_grad_iters
@@ -428,7 +433,7 @@ class RecurrentConvNLayer2(nn.Module):
                     kernel_size=kernel_size if i > 0 else 7,
                     stride=stride,
                     padding=kernel_size // 2 if i > 0 else 3,
-                    eta=self.eta,
+                    eta=self.eta_ls[i],
                     output_padding=output_padding,
                 )
             )
