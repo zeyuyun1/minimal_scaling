@@ -90,13 +90,30 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python main.py --gpus 4 --project_name scaling-new-
 # --in_channels 3 --num_basis 64,64,128,128 \
 # --n_iters_inter 2 --n_iters_intra 4 --eta_base 0.15 --sigma 0.01,2 \
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 python main.py --gpus 4 --project_name scaling-new-face \
---batch_size 128 --n_epochs 400 --lr 2e-4 --exp_name layer2-intra-deq-small-eta --model_arch recur_new \
---in_channels 3 --num_basis 64,64 \
---n_iters_inter 1 --n_iters_intra 1 --eta_base 0.1 --sigma 0.01,2
+# CUDA_VISIBLE_DEVICES=0,1,2,3 python main.py --gpus 4 --project_name scaling-new-face \
+# --batch_size 128 --n_epochs 400 --lr 2e-4 --exp_name layer2-intra-deq-small-eta --model_arch recur_new \
+# --in_channels 3 --num_basis 64,64 \
+# --n_iters_inter 1 --n_iters_intra 1 --eta_base 0.1 --sigma 0.01,2
 
 
-CUDA_VISIBLE_DEVICES=4,5,6,7 python main.py --gpus 4 --project_name scaling-new-face \
---batch_size 128 --n_epochs 400 --lr 2e-4 --exp_name layer2-no-recur \
---in_channels 3 --num_basis 64,64 \
---n_iters_inter 1 --n_iters_intra 1 --eta_base 0.2 --sigma 0.01,2 \
+# CUDA_VISIBLE_DEVICES=4,5,6,7 python main.py --gpus 4 --project_name scaling-new-face \
+# --batch_size 128 --n_epochs 400 --lr 2e-4 --exp_name layer2-no-recur \
+# --in_channels 3 --num_basis 64,64 \
+# --n_iters_inter 1 --n_iters_intra 1 --eta_base 0.2 --sigma 0.01,2 \
+
+# CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main.py --gpus 8 --project_name scaling-new-face \
+# --batch_size 128 --n_epochs 400 --lr 2e-4 --exp_name layer4-intra-deq-small-eta --model_arch recur_new \
+# --in_channels 3 --num_basis 64,64,128,128 \
+# --n_iters_inter 1 --n_iters_intra 1 --eta_base 0.01 --sigma 0.01,2
+
+# CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main.py --gpus 8 --project_name scaling-new-face \
+# --batch_size 128 --n_epochs 400 --lr 2e-4 --exp_name layer4-intra-deq-multi-eta --model_arch recur_new \
+# --in_channels 3 --num_basis 64,64,128,128 \
+# --n_iters_inter 1 --n_iters_intra 1 --eta_ls 0.01,0.05,0.01,0.005 --sigma 0.01,2
+
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main.py --gpus 8 --project_name scaling-new-face \
+--batch_size 128 --n_epochs 400 --lr 2e-4 --exp_name layer4-intra-deq-multi-eta --model_arch recur_new \
+--in_channels 3 --num_basis 64,64,128,128 \
+--n_iters_inter 1 --n_iters_intra 1 --eta_ls 0.1,0.1,0.05,0.02 --sigma 0.01,2 \
+--jfb_no_grad_iters 4,10 --jfb_with_grad_iters 1,2 --jfb_reuse_solution --jfb_ddp_safe

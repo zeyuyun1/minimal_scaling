@@ -16,7 +16,7 @@ from torchvision.datasets import ImageFolder
 from pytorch_lightning.utilities import rank_zero_only
 from torchvision.utils import make_grid
 
-from model import RecurrentConvNLayer,UNetBlind64,RecurrentConvNLayer2
+from model import RecurrentConvNLayer,UNetBlind64,RecurrentConvNLayer2,RecurrentConvNLayer3
 from torch.optim.lr_scheduler import LambdaLR
 import wandb
 import numpy as np
@@ -114,6 +114,10 @@ class LitDenoiser(pl.LightningModule):
         P_std: float = 0.5,
         edm_weighting: bool = False,
         eta_ls: list = None,
+        jfb_no_grad_iters: tuple = (0, 6),
+        jfb_with_grad_iters: tuple = (1, 3),
+        jfb_reuse_solution: bool = False,
+        jfb_ddp_safe: bool = True,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -135,7 +139,7 @@ class LitDenoiser(pl.LightningModule):
             )
         elif model_arch == "recur_new":
             print(eta_ls)
-            self.model = RecurrentConvNLayer2(
+            self.model = RecurrentConvNLayer3(
                 in_channels=in_channels,
                 num_basis=num_basis,
                 # eta_base=eta_base,
@@ -143,6 +147,10 @@ class LitDenoiser(pl.LightningModule):
                 kernel_size=kernel_size,
                 stride=stride,
                 eta_ls=eta_ls,
+                jfb_no_grad_iters=jfb_no_grad_iters,
+                jfb_with_grad_iters=jfb_with_grad_iters,
+                jfb_reuse_solution=jfb_reuse_solution,
+                jfb_ddp_safe=jfb_ddp_safe,
                 # n_iters_intra=n_iters_intra,
                 # whiten_dim=16,
             )
@@ -170,12 +178,16 @@ class LitDenoiser(pl.LightningModule):
                 n_iters_intra=n_iters_intra,
             )
         elif model_arch == "recur_new":
-            self.ema_model = RecurrentConvNLayer2(
+            self.ema_model = RecurrentConvNLayer3(
                 in_channels=in_channels,
                 num_basis=num_basis,
                 kernel_size=kernel_size,
                 stride=stride,
                 eta_ls=eta_ls,
+                jfb_no_grad_iters=jfb_no_grad_iters,
+                jfb_with_grad_iters=jfb_with_grad_iters,
+                jfb_reuse_solution=jfb_reuse_solution,
+                jfb_ddp_safe=jfb_ddp_safe,
             )
         else:
             self.ema_model = RecurrentConvNLayer(
@@ -385,6 +397,15 @@ if __name__ == "__main__":
                         help="Path to checkpoint file to load for initialization (e.g., 'pretrained_model/main/00001_experiment/denoiser.ckpt')")
     parser.add_argument("--eta_ls", type=lambda s: [float(item) for item in s.split(',')], default=None,
                         help="Comma-separated list for step size for each layer, e.g. '0.1,0.1'.")
+    # jfb_no_grad_iters
+    parser.add_argument("--jfb_no_grad_iters", type=lambda s: tuple(map(int, s.split(','))), default="0,6",
+                        help="Comma-separated list for number of no-grad iterations for each layer, e.g. '0,6'.")
+    parser.add_argument("--jfb_with_grad_iters", type=lambda s: tuple(map(int, s.split(','))), default="1,3",
+                        help="Comma-separated list for number of with-grad iterations for each layer, e.g. '1,3'.")
+    parser.add_argument("--jfb_reuse_solution", action="store_true", default=False,
+                        help="Use reuse solution for JFB (default: False)")
+    parser.add_argument("--jfb_ddp_safe", action="store_true", default=True,
+                        help="Use DDP-safe JFB (default: True)")
     args = parser.parse_args()
     
     # Set up experiment directory with index to avoid collisions
@@ -467,7 +488,11 @@ if __name__ == "__main__":
         P_mean=args.P_mean,
         P_std=args.P_std,
         edm_weighting = args.edm_weighting,
-        eta_ls=args.eta_ls
+        eta_ls=args.eta_ls,
+        jfb_no_grad_iters=args.jfb_no_grad_iters,
+        jfb_with_grad_iters=args.jfb_with_grad_iters,
+        jfb_reuse_solution=args.jfb_reuse_solution,
+        jfb_ddp_safe=args.jfb_ddp_safe,
     )
     
     # Load checkpoint if specified

@@ -388,8 +388,6 @@ class RecurrentConvNLayer(nn.Module):
 #                 for j in range(self.n_iters_intra):
 #                     a_cur, decoded_cur = self.levels[i](inp, a_prev=a_cur, top_signal=top_signal)
 #                 a[i], decoded[i] = a_cur, decoded_cur
-
-
 class RecurrentConvNLayer2(nn.Module):
     def __init__(self, in_channels, num_basis,
                  n_iters_inter=1, n_iters_intra=1,eta_base=0.1,
@@ -397,6 +395,134 @@ class RecurrentConvNLayer2(nn.Module):
                  # NEW: JFB controls
                  jfb_no_grad_iters=(0, 6),       # n in [0, N]
                  jfb_with_grad_iters=(1, 3),     # m in [1, M]
+                 jfb_reuse_solution=False,
+                 jfb_ddp_safe=True,
+                 ):
+        super().__init__()
+        self.n_levels = len(num_basis)
+        self.n_iters_inter = n_iters_inter           # keep as 1 for DEQ
+        self.n_iters_intra = n_iters_intra
+        self.eta_base = eta_base
+        # Default eta list if not provided; validate length
+        self.eta = eta_base / max(1, n_iters_intra)  # decouple from inter iters
+        # print(self.eta_ls)
+
+        self.jfb_no_grad_iters = jfb_no_grad_iters
+        self.jfb_with_grad_iters = jfb_with_grad_iters
+        self.jfb_reuse_solution = jfb_reuse_solution
+        self.jfb_ddp_safe = jfb_ddp_safe
+        self._last_a = None
+
+        if whiten_dim is not None:
+            self.encoder = Conv2d(in_channels, whiten_dim, kernel=3)
+            self.decoder = Conv2d(whiten_dim, in_channels, kernel=3)
+            prev_channels = whiten_dim
+        else:
+            self.encoder = nn.Identity()
+            self.decoder = nn.Identity()
+            prev_channels = in_channels
+
+        levels = []
+        for i, nb in enumerate(num_basis):
+            levels.append(
+                RecurrentConvUnit(
+                    in_channels=prev_channels,
+                    num_basis=nb,
+                    kernel_size=kernel_size if i > 0 else 7,
+                    stride=stride,
+                    padding=kernel_size // 2 if i > 0 else 3,
+                    eta=self.eta,
+                    output_padding=output_padding,
+                )
+            )
+            prev_channels = nb
+        self.levels = nn.ModuleList(levels)
+
+    def reset_fp_cache(self):
+        self._last_a = None
+
+    def forward(self, x, deq_mode=True):
+        """If deq_mode=True: stochastic JFB; else: legacy unrolled."""
+        x = self.encoder(x)
+
+        if not deq_mode:
+            # Legacy unrolling (no DEQ)
+            a = [None] * self.n_levels
+            decoded = [None] * self.n_levels
+            for _ in range(self.n_iters_inter):
+                self.forward_inter(x, a, decoded)
+            return self.decoder(decoded[0])
+
+        # ----- JFB / DEQ mode -----
+        # init hidden state
+        if self.jfb_reuse_solution and (self._last_a is not None):
+            a = [ai.clone() for ai in self._last_a]
+        else:
+            a = [None] * self.n_levels
+        decoded = [None] * self.n_levels
+
+        # n ~ U{0..N}
+        n0 = random.randint(self.jfb_no_grad_iters[0], self.jfb_no_grad_iters[1])
+        # m ~ U{1..M}
+        m1 = random.randint(self.jfb_with_grad_iters[0], self.jfb_with_grad_iters[1])
+
+        # ---- no-grad phase ----
+        if n0 > 0:
+            if self.jfb_ddp_safe:
+                # DDP-safe no-grad: just run and detach later
+                for _ in range(n0):
+                    self.forward_inter(x, a, decoded)
+            else:
+                with torch.no_grad():
+                    for _ in range(n0):
+                        self.forward_inter(x, a, decoded)
+
+        # cut graph between phases
+        a = [ai.detach() if ai is not None else None for ai in a]
+
+        # ---- with-grad phase ----
+        for _ in range(m1):
+            self.forward_inter(x, a, decoded)
+
+        # cache solution if desired
+        if self.jfb_reuse_solution:
+            self._last_a = [ai.detach() if ai is not None else None for ai in a]
+
+        return self.decoder(decoded[0])
+
+    def forward_inter(self, x, a, decoded):
+        # bottom-up
+        for i in range(len(self.levels)):
+            inp = x if i == 0 else a[i - 1]
+            top_signal = decoded[i + 1] if i < self.n_levels - 1 else None
+            a_cur = a[i]
+            for _ in range(self.n_iters_intra):
+                a_cur, decoded_cur = self.levels[i](inp, a_prev=a_cur, top_signal=top_signal)
+            a[i], decoded[i] = a_cur, decoded_cur
+
+        # top-down
+        for i in range(self.n_levels - 1, -1, -1):
+            inp = x if i == 0 else a[i - 1]
+            top_signal = decoded[i + 1] if i < self.n_levels - 1 else None
+            a_cur = a[i]
+            for _ in range(self.n_iters_intra):
+                a_cur, decoded_cur = self.levels[i](inp, a_prev=a_cur, top_signal=top_signal)
+            a[i], decoded[i] = a_cur, decoded_cur
+
+# Unet
+class GroupNorm32(nn.GroupNorm):
+    def forward(self, x):
+        # run in float32 then cast back to original dtype
+        return super().forward(x.float()).type(x.dtype)
+
+
+class RecurrentConvNLayer3(nn.Module):
+    def __init__(self, in_channels, num_basis,
+                 n_iters_inter=1, n_iters_intra=1,eta_base=0.1,
+                 kernel_size=5, stride=2, output_padding=1, whiten_dim=None,
+                 # NEW: JFB controls
+                jfb_no_grad_iters=None,       # n in [0, N]
+                jfb_with_grad_iters=None,     # m in [1, M]
                  jfb_reuse_solution=False,
                  jfb_ddp_safe=True,
                  eta_ls = None):
@@ -415,8 +541,9 @@ class RecurrentConvNLayer2(nn.Module):
         # self.eta = eta_base / max(1, n_iters_intra)  # decouple from inter iters
         # print(self.eta_ls)
 
-        self.jfb_no_grad_iters = jfb_no_grad_iters
-        self.jfb_with_grad_iters = jfb_with_grad_iters
+        # Default JFB tuples if None
+        self.jfb_no_grad_iters = (0, 6) if jfb_no_grad_iters is None else tuple(jfb_no_grad_iters)
+        self.jfb_with_grad_iters = (1, 3) if jfb_with_grad_iters is None else tuple(jfb_with_grad_iters)
         self.jfb_reuse_solution = jfb_reuse_solution
         self.jfb_ddp_safe = jfb_ddp_safe
         self._last_a = None
