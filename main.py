@@ -16,11 +16,142 @@ from torchvision.datasets import ImageFolder
 from pytorch_lightning.utilities import rank_zero_only
 from torchvision.utils import make_grid
 
-from model import RecurrentConvNLayer,UNetBlind64,RecurrentConvNLayer2,RecurrentConvNLayer3
+from model import RecurrentConvNLayer,UNetBlind64,RecurrentConvNLayer2,RecurrentConvNLayer3,RecurrentConvNLayer_cc
 from torch.optim.lr_scheduler import LambdaLR
 import wandb
 import numpy as np
 import math
+
+import torch
+from torch import nn
+
+def _endswith_lookup(state_dict, suffix):
+    for k in state_dict.keys():
+        if k.endswith(suffix):
+            return k
+    return None
+
+@torch.no_grad()
+def load_ff_encoders_from_checkpoint(lit_module, ckpt_path, copy_outer_encoder=True, strict_shape=True):
+    """
+    Copy ONLY feed-forward encoder weights (and biases) into:
+      - lit_module.model
+      - lit_module.ema_model
+    from a checkpoint file that may be a PL checkpoint or a raw state_dict.
+
+    Args:
+        lit_module: your LightningModule (instance of LitDenoiser)
+        ckpt_path:  path to .ckpt or .pth
+        copy_outer_encoder: also copy model.encoder if present (whitening)
+        strict_shape: if True, only copy when shapes match exactly
+    """
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    sd = ckpt.get("state_dict", ckpt)  # PL or raw
+
+    def _copy_into(target_model):
+        root = getattr(target_model, "model", target_model)  # in case of nested
+        # (a) copy outer whitening encoder if requested
+        if copy_outer_encoder and hasattr(root, "encoder") and isinstance(root.encoder, nn.Module):
+            for suf in [".encoder.weight", ".encoder.conv.weight"]:
+                key = _endswith_lookup(sd, f"{suf}")
+                if key is None:
+                    # try common prefixes
+                    key = _endswith_lookup(sd, f".model{suf}") or _endswith_lookup(sd, f".model.model{suf}")
+                if key is not None:
+                    src_w = sd[key]
+                    if hasattr(root.encoder, "weight"):
+                        if (not strict_shape) or (root.encoder.weight.shape == src_w.shape):
+                            root.encoder.weight.copy_(src_w)
+                    # bias
+                    bkey = key.replace("weight", "bias")
+                    if hasattr(root.encoder, "bias") and (root.encoder.bias is not None) and (bkey in sd):
+                        src_b = sd[bkey]
+                        if (not strict_shape) or (root.encoder.bias.shape == src_b.shape):
+                            root.encoder.bias.copy_(src_b)
+                    break  # found one version
+
+        # (b) per-level encoders of RecurrentConvUnit
+        if not hasattr(root, "levels"):
+            return
+        for i, lev in enumerate(root.levels):
+            if not hasattr(lev, "encoder") or not isinstance(lev.encoder, nn.Module):
+                continue
+            # look for any of these suffixes in the ckpt:
+            suffixes = [
+                f".levels.{i}.encoder.weight",           # most common
+                f".model.levels.{i}.encoder.weight",     # PL prefix
+                f".model.model.levels.{i}.encoder.weight",
+            ]
+            key = None
+            for suf in suffixes:
+                key = _endswith_lookup(sd, suf)
+                if key: break
+            # fallback: suffix-only search
+            if key is None:
+                key = _endswith_lookup(sd, f".levels.{i}.encoder.weight")
+            if key is None:
+                # nothing found; skip this level
+                continue
+
+            src_w = sd[key]
+            if hasattr(lev.encoder, "weight"):
+                if (not strict_shape) or (lev.encoder.weight.shape == src_w.shape):
+                    lev.encoder.weight.copy_(src_w)
+            # bias if present
+            bkey = key.replace("weight", "bias")
+            if hasattr(lev.encoder, "bias") and (lev.encoder.bias is not None) and (bkey in sd):
+                src_b = sd[bkey]
+                if (not strict_shape) or (lev.encoder.bias.shape == src_b.shape):
+                    lev.encoder.bias.copy_(src_b)
+
+    # copy into main model
+    _copy_into(lit_module)
+    # copy into EMA model too
+    if hasattr(lit_module, "ema_model"):
+        _copy_into(lit_module.ema_model)
+
+import math, torch, torch.nn as nn, torch.nn.functional as F
+
+@torch.no_grad()
+def renorm_conv_to_kaiming_(conv: nn.Conv2d):
+    if not isinstance(conv, nn.Conv2d): return
+    w = conv.weight
+    fan_in = w.shape[1] * w.shape[2] * w.shape[3]
+    target_std = math.sqrt(2.0 / max(1, fan_in))
+    cur_std = w.std().clamp_min(1e-8)
+    scale = (target_std / cur_std).item()
+    w.mul_(scale)
+    # leave bias as-is
+
+@torch.no_grad()
+def spectral_rescale_conv2d_(conv: nn.Conv2d, x_shape=(1,1,64,64), target_sn=1.0, iters=10):
+    """One-time power iteration to estimate ||W||_2 and rescale to <= target_sn."""
+    if not isinstance(conv, nn.Conv2d): return
+    device = conv.weight.device
+    u = torch.randn(x_shape, device=device)
+    u = u / (u.norm() + 1e-9)
+    for _ in range(iters):
+        v = F.conv2d(u, conv.weight, stride=conv.stride, padding=conv.padding, dilation=conv.dilation, groups=conv.groups)
+        v = v / (v.norm() + 1e-9)
+        u = F.conv_transpose2d(v, conv.weight, stride=conv.stride, padding=conv.padding, dilation=conv.dilation, groups=conv.groups)
+        u = u / (u.norm() + 1e-9)
+    # Rayleigh quotient ≈ spectral norm
+    v = F.conv2d(u, conv.weight, stride=conv.stride, padding=conv.padding, dilation=conv.dilation, groups=conv.groups)
+    sn = v.norm().item()
+    if sn > 1e-8 and sn > target_sn:
+        conv.weight.mul_(target_sn / sn)
+
+def renorm_ff_stack_(root, mode="kaiming"):
+    # outer whitening (if any)
+    if hasattr(root, "encoder") and isinstance(root.encoder, nn.Conv2d):
+        if mode=="kaiming": renorm_conv_to_kaiming_(root.encoder)
+        else: spectral_rescale_conv2d_(root.encoder, target_sn=1.0)
+    # per level
+    for lev in getattr(root, "levels", []):
+        if hasattr(lev, "encoder") and isinstance(lev.encoder, nn.Conv2d):
+            if mode=="kaiming": renorm_conv_to_kaiming_(lev.encoder)
+            else: spectral_rescale_conv2d_(lev.encoder, target_sn=1.0)
+
 
 
 def _to_wandb_image(chw: torch.Tensor):
@@ -138,11 +269,11 @@ class LitDenoiser(pl.LightningModule):
                 n_iters_intra=n_iters_intra
             )
         elif model_arch == "recur_new":
-            print(eta_ls)
+            # print(eta_ls)
             self.model = RecurrentConvNLayer3(
                 in_channels=in_channels,
                 num_basis=num_basis,
-                # eta_base=eta_base,
+                eta_base=eta_base,
                 # n_iters_inter=n_iters_inter,
                 kernel_size=kernel_size,
                 stride=stride,
@@ -152,6 +283,17 @@ class LitDenoiser(pl.LightningModule):
                 jfb_reuse_solution=jfb_reuse_solution,
                 jfb_ddp_safe=jfb_ddp_safe,
                 # n_iters_intra=n_iters_intra,
+                # whiten_dim=16,
+            )
+        elif model_arch == "recur_cc":
+            self.model = RecurrentConvNLayer_cc(
+                in_channels=in_channels,
+                num_basis=num_basis,
+                eta_base=eta_base,
+                n_iters_inter=n_iters_inter,
+                kernel_size=kernel_size,
+                stride=stride,
+                n_iters_intra=n_iters_intra,
                 # whiten_dim=16,
             )
         else:
@@ -181,6 +323,7 @@ class LitDenoiser(pl.LightningModule):
             self.ema_model = RecurrentConvNLayer3(
                 in_channels=in_channels,
                 num_basis=num_basis,
+                eta_base=eta_base,
                 kernel_size=kernel_size,
                 stride=stride,
                 eta_ls=eta_ls,
@@ -471,7 +614,7 @@ if __name__ == "__main__":
     # Prepare data and model
     # dm = MNISTDataModule(batch_size=args.batch_size)
     lr = args.lr*args.batch_size/64*args.gpus
-    print(args.eta_ls)
+    # print(args.eta_ls)
     model = LitDenoiser(
         in_channels=args.in_channels,
         num_basis=args.num_basis,
@@ -497,75 +640,83 @@ if __name__ == "__main__":
     
     # Load checkpoint if specified
     if args.checkpoint_path:
-        if not os.path.exists(args.checkpoint_path):
-            raise FileNotFoundError(f"Checkpoint file not found: {args.checkpoint_path}")
+        # if not os.path.exists(args.checkpoint_path):
+        #     raise FileNotFoundError(f"Checkpoint file not found: {args.checkpoint_path}")
         
-        print(f"Loading checkpoint from: {args.checkpoint_path}")
-        checkpoint = torch.load(args.checkpoint_path, map_location='cpu')
+        # print(f"Loading checkpoint from: {args.checkpoint_path}")
+        # checkpoint = torch.load(args.checkpoint_path, map_location='cpu')
         
-        def fix_state_dict_keys(state_dict, prefix="model."):
-            """Fix state dict keys by adding the model prefix if needed"""
-            fixed_dict = {}
-            for key, value in state_dict.items():
-                if key.startswith(prefix):
-                    # Already has the correct prefix
-                    fixed_dict[key] = value
-                else:
-                    # Add the prefix
-                    fixed_dict[prefix + key] = value
-            return fixed_dict
+        # def fix_state_dict_keys(state_dict, prefix="model."):
+        #     """Fix state dict keys by adding the model prefix if needed"""
+        #     fixed_dict = {}
+        #     for key, value in state_dict.items():
+        #         if key.startswith(prefix):
+        #             # Already has the correct prefix
+        #             fixed_dict[key] = value
+        #         else:
+        #             # Add the prefix
+        #             fixed_dict[prefix + key] = value
+        #     return fixed_dict
         
-        # Load the model state dict
-        if 'state_dict' in checkpoint:
-            # PyTorch Lightning checkpoint format
-            state_dict = checkpoint['state_dict']
-            # Try loading as-is first
-            try:
-                model.load_state_dict(state_dict, strict=True)
-                print("Loaded model weights from PyTorch Lightning checkpoint")
-            except RuntimeError as e:
-                if "Missing key(s)" in str(e) or "Unexpected key(s)" in str(e):
-                    print("Key mismatch detected, attempting to fix keys...")
-                    # Try fixing keys by adding model prefix
-                    fixed_state_dict = fix_state_dict_keys(state_dict, "model.")
-                    model.load_state_dict(fixed_state_dict, strict=False)
-                    print("Loaded model weights with key fixes applied")
-                else:
-                    raise e
-        else:
-            # Direct state dict format
-            try:
-                model.load_state_dict(checkpoint, strict=True)
-                print("Loaded model weights from state dict")
-            except RuntimeError as e:
-                if "Missing key(s)" in str(e) or "Unexpected key(s)" in str(e):
-                    print("Key mismatch detected, attempting to fix keys...")
-                    # Try fixing keys by adding model prefix
-                    fixed_state_dict = fix_state_dict_keys(checkpoint, "model.")
-                    model.load_state_dict(fixed_state_dict, strict=False)
-                    print("Loaded model weights with key fixes applied")
-                else:
-                    raise e
+        # # Load the model state dict
+        # if 'state_dict' in checkpoint:
+        #     # PyTorch Lightning checkpoint format
+        #     state_dict = checkpoint['state_dict']
+        #     # Try loading as-is first
+        #     try:
+        #         model.load_state_dict(state_dict, strict=True)
+        #         print("Loaded model weights from PyTorch Lightning checkpoint")
+        #     except RuntimeError as e:
+        #         if "Missing key(s)" in str(e) or "Unexpected key(s)" in str(e):
+        #             print("Key mismatch detected, attempting to fix keys...")
+        #             # Try fixing keys by adding model prefix
+        #             fixed_state_dict = fix_state_dict_keys(state_dict, "model.")
+        #             model.load_state_dict(fixed_state_dict, strict=False)
+        #             print("Loaded model weights with key fixes applied")
+        #         else:
+        #             raise e
+        # else:
+        #     # Direct state dict format
+        #     try:
+        #         model.load_state_dict(checkpoint, strict=True)
+        #         print("Loaded model weights from state dict")
+        #     except RuntimeError as e:
+        #         if "Missing key(s)" in str(e) or "Unexpected key(s)" in str(e):
+        #             print("Key mismatch detected, attempting to fix keys...")
+        #             # Try fixing keys by adding model prefix
+        #             fixed_state_dict = fix_state_dict_keys(checkpoint, "model.")
+        #             model.load_state_dict(fixed_state_dict, strict=False)
+        #             print("Loaded model weights with key fixes applied")
+        #         else:
+        #             raise e
         
-        # Also try to load EMA model if available
-        if 'ema_model' in checkpoint:
-            try:
-                model.ema_model.load_state_dict(checkpoint['ema_model'], strict=True)
-                print("Loaded EMA model weights from checkpoint")
-            except RuntimeError as e:
-                if "Missing key(s)" in str(e) or "Unexpected key(s)" in str(e):
-                    print("EMA key mismatch detected, attempting to fix keys...")
-                    fixed_ema_dict = fix_state_dict_keys(checkpoint['ema_model'], "model.")
-                    model.ema_model.load_state_dict(fixed_ema_dict, strict=False)
-                    print("Loaded EMA model weights with key fixes applied")
-                else:
-                    raise e
-        else:
-            # If no EMA weights in checkpoint, copy from main model
-            model.ema_model.load_state_dict(model.model.state_dict())
-            print("Initialized EMA model with main model weights")
-        
+        # # Also try to load EMA model if available
+        # if 'ema_model' in checkpoint:
+        #     try:
+        #         model.ema_model.load_state_dict(checkpoint['ema_model'], strict=True)
+        #         print("Loaded EMA model weights from checkpoint")
+        #     except RuntimeError as e:
+        #         if "Missing key(s)" in str(e) or "Unexpected key(s)" in str(e):
+        #             print("EMA key mismatch detected, attempting to fix keys...")
+        #             fixed_ema_dict = fix_state_dict_keys(checkpoint['ema_model'], "model.")
+        #             model.ema_model.load_state_dict(fixed_ema_dict, strict=False)
+        #             print("Loaded EMA model weights with key fixes applied")
+        #         else:
+        #             raise e
+        # else:
+        #     # If no EMA weights in checkpoint, copy from main model
+        #     model.ema_model.load_state_dict(model.model.state_dict())
+        #     print("Initialized EMA model with main model weights")
+        print(f"Loading ONLY feed-forward encoders from: {args.checkpoint_path}")
+        load_ff_encoders_from_checkpoint(model, args.checkpoint_path,
+                                        copy_outer_encoder=True, strict_shape=True)
+        renorm_ff_stack_(model.model, mode="kaiming")
+        renorm_ff_stack_(model.ema_model, mode="kaiming")
         print("Checkpoint loading completed successfully!")
+
+
+
+
     
     # Select DataModule based on dataset
     if args.dataset == "mnist":

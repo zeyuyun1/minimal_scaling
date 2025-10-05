@@ -116,7 +116,76 @@ class RecurrentConvUnit(nn.Module):
             bias=False,
             # groups=num_basis//4
         )
-        torch.nn.init.dirac_(self.M.weight)
+        # torch.nn.init.dirac_(self.M.weight)
+        torch.nn.init.constant_(self.M.weight, 0)
+        
+        # Tied transpose convolution for decoding. The added output_padding ensures
+        # that the reconstructed (decoded) tensor matches the dimensions of a_prev.
+        self.decoder = TiedTransposeConv(self.encoder, output_padding=output_padding)
+        self.eta = eta
+        self.relu = nn.ReLU()
+
+    def forward(self, x, a_prev=None, top_signal=None):
+        """
+        Forward pass that updates the latent variable.
+        
+        Args:
+          x: Input activation (or lower-layer feature map).
+          a_prev: Previous latent variable (if None, initialize from feedforward drive).
+          top_signal: Top-down feedback signal (must match the shape of the latent code).
+        """
+        # Use zero feedback if none provided.
+        feedback = top_signal if top_signal is not None else 0
+        
+        if a_prev is None:
+            # Initial iteration: use only feedforward drive.
+            a = self.relu(self.eta * (self.encoder(x) + feedback))
+        else:
+            # Otherwise, update the previous state.
+            update = self.encoder(x) + self.M(a_prev)
+            a = self.relu(a_prev + self.eta * (update + feedback))
+        
+        # Decode (reconstruct) from the latent representation.
+        decoded = self.decoder(a)
+        return a, decoded
+
+class RecurrentConvUnit_cc(nn.Module):
+    """
+    Convolutional recurrent unit, now with output_padding added to the decoder
+    to ensure that the reconstructed feedback has matching spatial dimensions.
+    
+    The update rule is:
+    
+        a_{t+1} = ReLU( a_t + η * ( encoder(x) + M(a_t) + top_signal ) )
+        
+    where:
+      - encoder(x) is the feedforward drive (implemented as a conv with stride 2).
+      - M is a local (1x1, group) convolution.
+      - top_signal is a top-down feedback signal.
+    """
+    def __init__(self, in_channels, num_basis, kernel_size=7, stride=2,
+                 padding=3, eta=0.5, init_lambda=0.1, output_padding=1):
+        super(RecurrentConvUnit_cc, self).__init__()
+        # Convolutional dictionary encoder.
+        self.encoder = nn.Conv2d(
+            in_channels, num_basis,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            bias=True
+        )
+        nn.init.constant_(self.encoder.bias, -init_lambda)
+        
+        # Horizontal / lateral connection: using a 1x1 grouped convolution.
+        self.M = nn.Conv2d(
+            num_basis, num_basis,
+            kernel_size=3,
+            padding =1,
+            bias=False,
+            # groups=num_basis//4
+        )
+        # init M's weight to 0
+        torch.nn.init.constant_(self.M.weight, 0)
         
         # Tied transpose convolution for decoding. The added output_padding ensures
         # that the reconstructed (decoded) tensor matches the dimensions of a_prev.
@@ -538,6 +607,7 @@ class RecurrentConvNLayer3(nn.Module):
             if len(eta_ls) != self.n_levels:
                 raise ValueError(f"eta_ls length {len(eta_ls)} must match number of levels {self.n_levels}")
             self.eta_ls = [float(x) for x in eta_ls]
+        print(self.eta_ls)
         # self.eta = eta_base / max(1, n_iters_intra)  # decouple from inter iters
         # print(self.eta_ls)
 
@@ -641,6 +711,99 @@ class RecurrentConvNLayer3(nn.Module):
             top_signal = decoded[i + 1] if i < self.n_levels - 1 else None
             a_cur = a[i]
             for _ in range(self.n_iters_intra):
+                a_cur, decoded_cur = self.levels[i](inp, a_prev=a_cur, top_signal=top_signal)
+            a[i], decoded[i] = a_cur, decoded_cur
+
+class RecurrentConvNLayer_cc(nn.Module):
+    """
+    n‑layer hierarchical convolutional sparse coding model with top‑down feedback.
+
+    Parameters:
+      - in_channels:    Number of channels in the input (e.g. 1 for grayscale).
+      - num_basis:      Sequence of latent‐channel sizes, length = n.
+      - eta:            Step size for all levels.
+      - n_iters_inter:  Number of unrolled inference iterations.
+      - kernel_size, stride, padding, output_padding: conv params for every level.
+    """
+    def __init__(self,
+                 in_channels: int,
+                 num_basis: list[int],
+                 eta_base: float = None,
+                 n_iters_inter: int = 2,
+                 n_iters_intra: int = 1,
+                 kernel_size: int = 5,
+                 stride: int = 2,
+                 output_padding: int = 1,
+                 whiten_dim=None):
+        super().__init__()
+        self.n_iters_inter = n_iters_inter
+        n_iters_train = n_iters_inter*n_iters_intra
+        self.n_levels = len(num_basis)
+        self.eta = eta_base/n_iters_train
+        # assert n_iters_train % n_iters_intra == 0, "n_iters_train must be divisible by n_iters_intra"
+        self.n_iters_inter = n_iters_inter
+        self.n_iters_intra = n_iters_intra
+        self.whiten_dim = whiten_dim
+        if whiten_dim is not None:
+            self.encoder = Conv2d(
+                in_channels=in_channels,
+                out_channels=whiten_dim,
+                kernel=3)
+            
+            self.decoder = Conv2d(
+                in_channels=whiten_dim,
+                out_channels=in_channels,
+                kernel=3)
+            prev_channels = whiten_dim
+        else:
+            self.encoder = nn.Identity()
+            self.decoder = nn.Identity()
+            prev_channels = in_channels
+        
+        # build a ModuleList of RecurrentConvUnit, chaining channels
+        levels = []
+        for i,nb in enumerate(num_basis):
+            levels.append(
+                RecurrentConvUnit_cc(
+                    in_channels=prev_channels,
+                    num_basis=nb,
+                    kernel_size=kernel_size if i>0 else 7,
+                    stride=stride,
+                    padding=kernel_size//2 if i>0 else 3,
+                    eta=self.eta,
+                    output_padding=output_padding
+                )
+            )
+            prev_channels = nb
+        self.levels = nn.ModuleList(levels)
+
+    def forward(self, x):
+        # initialize latent activations & decodings
+        a = [None] * self.n_levels
+        decoded = [None] * self.n_levels
+        x = self.encoder(x)
+
+        for i_out in range(self.n_iters_inter):
+            self.forward_inter(x, a, decoded)
+
+        # final reconstruction from the first level
+        return self.decoder(decoded[0])
+
+    def forward_inter(self, x, a, decoded):
+        for i in range(len(self.levels)):
+            inp = x if i == 0 else a[i-1]
+            top_signal = decoded[i+1] if i < self.n_levels-1 else None
+            a_cur = a[i]
+            for j in range(self.n_iters_intra):
+                a_cur, decoded_cur = self.levels[i](inp, a_prev=a_cur, top_signal=top_signal)
+            a[i], decoded[i] = a_cur, decoded_cur
+
+        # top‑down refinement (exclude the topmost level)
+        for i in range(self.n_levels-1, -1, -1):
+            inp = x if i == 0 else a[i-1]
+            top_signal = decoded[i+1] if i < self.n_levels-1 else None
+            a_cur = a[i]
+            for j in range(self.n_iters_intra):
                 a_cur, decoded_cur = self.levels[i](inp, a_prev=a_cur, top_signal=top_signal)
             a[i], decoded[i] = a_cur, decoded_cur
 
