@@ -549,6 +549,8 @@ if __name__ == "__main__":
                         help="Use reuse solution for JFB (default: False)")
     parser.add_argument("--jfb_ddp_safe", action="store_true", default=True,
                         help="Use DDP-safe JFB (default: True)")
+    parser.add_argument("--load_all_weights", action="store_true", default=False,
+                        help="Load all weights from checkpoint (default: False)")
     args = parser.parse_args()
     
     # Set up experiment directory with index to avoid collisions
@@ -640,79 +642,81 @@ if __name__ == "__main__":
     
     # Load checkpoint if specified
     if args.checkpoint_path:
-        # if not os.path.exists(args.checkpoint_path):
-        #     raise FileNotFoundError(f"Checkpoint file not found: {args.checkpoint_path}")
-        
-        # print(f"Loading checkpoint from: {args.checkpoint_path}")
-        # checkpoint = torch.load(args.checkpoint_path, map_location='cpu')
-        
-        # def fix_state_dict_keys(state_dict, prefix="model."):
-        #     """Fix state dict keys by adding the model prefix if needed"""
-        #     fixed_dict = {}
-        #     for key, value in state_dict.items():
-        #         if key.startswith(prefix):
-        #             # Already has the correct prefix
-        #             fixed_dict[key] = value
-        #         else:
-        #             # Add the prefix
-        #             fixed_dict[prefix + key] = value
-        #     return fixed_dict
-        
-        # # Load the model state dict
-        # if 'state_dict' in checkpoint:
-        #     # PyTorch Lightning checkpoint format
-        #     state_dict = checkpoint['state_dict']
-        #     # Try loading as-is first
-        #     try:
-        #         model.load_state_dict(state_dict, strict=True)
-        #         print("Loaded model weights from PyTorch Lightning checkpoint")
-        #     except RuntimeError as e:
-        #         if "Missing key(s)" in str(e) or "Unexpected key(s)" in str(e):
-        #             print("Key mismatch detected, attempting to fix keys...")
-        #             # Try fixing keys by adding model prefix
-        #             fixed_state_dict = fix_state_dict_keys(state_dict, "model.")
-        #             model.load_state_dict(fixed_state_dict, strict=False)
-        #             print("Loaded model weights with key fixes applied")
-        #         else:
-        #             raise e
-        # else:
-        #     # Direct state dict format
-        #     try:
-        #         model.load_state_dict(checkpoint, strict=True)
-        #         print("Loaded model weights from state dict")
-        #     except RuntimeError as e:
-        #         if "Missing key(s)" in str(e) or "Unexpected key(s)" in str(e):
-        #             print("Key mismatch detected, attempting to fix keys...")
-        #             # Try fixing keys by adding model prefix
-        #             fixed_state_dict = fix_state_dict_keys(checkpoint, "model.")
-        #             model.load_state_dict(fixed_state_dict, strict=False)
-        #             print("Loaded model weights with key fixes applied")
-        #         else:
-        #             raise e
-        
-        # # Also try to load EMA model if available
-        # if 'ema_model' in checkpoint:
-        #     try:
-        #         model.ema_model.load_state_dict(checkpoint['ema_model'], strict=True)
-        #         print("Loaded EMA model weights from checkpoint")
-        #     except RuntimeError as e:
-        #         if "Missing key(s)" in str(e) or "Unexpected key(s)" in str(e):
-        #             print("EMA key mismatch detected, attempting to fix keys...")
-        #             fixed_ema_dict = fix_state_dict_keys(checkpoint['ema_model'], "model.")
-        #             model.ema_model.load_state_dict(fixed_ema_dict, strict=False)
-        #             print("Loaded EMA model weights with key fixes applied")
-        #         else:
-        #             raise e
-        # else:
-        #     # If no EMA weights in checkpoint, copy from main model
-        #     model.ema_model.load_state_dict(model.model.state_dict())
-        #     print("Initialized EMA model with main model weights")
-        print(f"Loading ONLY feed-forward encoders from: {args.checkpoint_path}")
-        load_ff_encoders_from_checkpoint(model, args.checkpoint_path,
-                                        copy_outer_encoder=True, strict_shape=True)
-        renorm_ff_stack_(model.model, mode="kaiming")
-        renorm_ff_stack_(model.ema_model, mode="kaiming")
-        print("Checkpoint loading completed successfully!")
+        if args.load_all_weights:
+            if not os.path.exists(args.checkpoint_path):
+                raise FileNotFoundError(f"Checkpoint file not found: {args.checkpoint_path}")
+            
+            print(f"Loading checkpoint from: {args.checkpoint_path}")
+            checkpoint = torch.load(args.checkpoint_path, map_location='cpu')
+            
+            def fix_state_dict_keys(state_dict, prefix="model."):
+                """Fix state dict keys by adding the model prefix if needed"""
+                fixed_dict = {}
+                for key, value in state_dict.items():
+                    if key.startswith(prefix):
+                        # Already has the correct prefix
+                        fixed_dict[key] = value
+                    else:
+                        # Add the prefix
+                        fixed_dict[prefix + key] = value
+                return fixed_dict
+            
+            # Load the model state dict
+            if 'state_dict' in checkpoint:
+                # PyTorch Lightning checkpoint format
+                state_dict = checkpoint['state_dict']
+                # Try loading as-is first
+                try:
+                    model.load_state_dict(state_dict, strict=True)
+                    print("Loaded model weights from PyTorch Lightning checkpoint")
+                except RuntimeError as e:
+                    if "Missing key(s)" in str(e) or "Unexpected key(s)" in str(e):
+                        print("Key mismatch detected, attempting to fix keys...")
+                        # Try fixing keys by adding model prefix
+                        fixed_state_dict = fix_state_dict_keys(state_dict, "model.")
+                        model.load_state_dict(fixed_state_dict, strict=False)
+                        print("Loaded model weights with key fixes applied")
+                    else:
+                        raise e
+            else:
+                # Direct state dict format
+                try:
+                    model.load_state_dict(checkpoint, strict=True)
+                    print("Loaded model weights from state dict")
+                except RuntimeError as e:
+                    if "Missing key(s)" in str(e) or "Unexpected key(s)" in str(e):
+                        print("Key mismatch detected, attempting to fix keys...")
+                        # Try fixing keys by adding model prefix
+                        fixed_state_dict = fix_state_dict_keys(checkpoint, "model.")
+                        model.load_state_dict(fixed_state_dict, strict=False)
+                        print("Loaded model weights with key fixes applied")
+                    else:
+                        raise e
+            
+            # Also try to load EMA model if available
+            if 'ema_model' in checkpoint:
+                try:
+                    model.ema_model.load_state_dict(checkpoint['ema_model'], strict=True)
+                    print("Loaded EMA model weights from checkpoint")
+                except RuntimeError as e:
+                    if "Missing key(s)" in str(e) or "Unexpected key(s)" in str(e):
+                        print("EMA key mismatch detected, attempting to fix keys...")
+                        fixed_ema_dict = fix_state_dict_keys(checkpoint['ema_model'], "model.")
+                        model.ema_model.load_state_dict(fixed_ema_dict, strict=False)
+                        print("Loaded EMA model weights with key fixes applied")
+                    else:
+                        raise e
+            else:
+                # If no EMA weights in checkpoint, copy from main model
+                model.ema_model.load_state_dict(model.model.state_dict())
+                print("Initialized EMA model with main model weights")
+        else:
+            print("Loading ONLY feed-forward encoders from: {args.checkpoint_path}")
+            load_ff_encoders_from_checkpoint(model, args.checkpoint_path,
+                                            copy_outer_encoder=True, strict_shape=True)
+            renorm_ff_stack_(model.model, mode="kaiming")
+            renorm_ff_stack_(model.ema_model, mode="kaiming")
+            print("Checkpoint loading completed successfully!")
 
 
 
