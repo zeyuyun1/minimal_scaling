@@ -413,9 +413,22 @@ python main.py --gpus 4 --project_name scaling-VH-new --batch_size 64 --n_epochs
 --whiten_dim 16 --kernel_size 7 --jfb_no_grad_iters 4,20 --jfb_with_grad_iters 1,5 --eta_base 0.1 --edm_weighting \
 --jfb_reuse_solution_rate 0.3 --load_all_weights --checkpoint_path pretrained_model/scaling-VH-new/00085_layer1-SC-whiten-1-noise-labels-zero-scratch-horizontal-weighting-no-reuse/denoiser.ckpt
 
+CUDA_VISIBLE_DEVICES=4,5,6,7 python main.py --gpus 4 --project_name scaling-VH-new --batch_size 64 --n_epochs 1000 \
+--lr 1e-4 --exp_name layer1-SC-whiten-1-noise-labels-zero-scratch-horizontal-weighting-straighten-from-reuse \
+--model_arch SC_reuse --in_channels 1 --num_basis 128 --sigma 0.01,0.5 --P_mean=-1.6 --P_std=0.7 \
+--data_dir /home/zeyu/vanhateren_all/vh_patches256_train/ --grayscale --img_size 128 --random_crop \
+--whiten_dim 16 --kernel_size 7 --jfb_no_grad_iters 4,20 --jfb_with_grad_iters 1,5 --eta_base 0.1 --edm_weighting \
+--jfb_reuse_solution_rate 0.5 --load_all_weights --checkpoint_path pretrained_model/scaling-VH-new/00086_layer1-SC-whiten-1-noise-labels-zero-scratch-horizontal-weighting-reuse/denoiser.ckpt
+ 
 
 
 
+
+# straighten non horizontal model
+python main.py --gpus 4 --project_name scaling-VH-new --batch_size 64 --n_epochs 1000 --lr 1e-4 --exp_name layer1-SC-whiten-1-noise-labels-zero-scratch-weighting-straighten \
+ --model_arch SC --in_channels 1 --num_basis 128 --sigma 0.01,0.5 --P_mean=-1.6 --P_std=0.7 --data_dir /home/zeyu/vanhateren_all/vh_patches256_train/ --grayscale \
+  --img_size 128 --random_crop --whiten_dim 16 --kernel_size 7 --jfb_no_grad_iters 5,20 --jfb_with_grad_iters 1,5 --eta_base 0.1 --edm_weighting --no_learning_horizontal \
+ --load_all_weights --checkpoint_path pretrained_model/scaling-VH-new/00061_layer1-SC-whiten-1-noise-labels-zero-scratch-weighting/denoiser.ckpt
 
 
 # python main.py --gpus 4 --project_name scaling-VH-new --batch_size 64 --n_epochs 1000  \
