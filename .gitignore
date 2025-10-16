@@ -19,6 +19,7 @@ wandb/
 
 # Test files
 test_images/
+figures/
 
 # OS
 .DS_Store

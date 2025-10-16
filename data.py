@@ -99,6 +99,7 @@ class ImageDataModule(pl.LightningDataModule):
             shuffle=True,
             num_workers=self.num_workers,
             pin_memory=True,
+            drop_last=True,
         )
 
     def val_dataloader(self):
@@ -108,6 +109,7 @@ class ImageDataModule(pl.LightningDataModule):
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=True,
+            drop_last=True,
         )
 
     def test_dataloader(self):

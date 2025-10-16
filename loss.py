@@ -1,7 +1,5 @@
 import torch
 
-import torch
-
 class SimpleNoiseLoss:
     """
     Blind denoising loss with configurable σ sampling and σ-aware weighting.
@@ -135,7 +133,7 @@ class EDMLossNoCond:
     Calls net(y+n, sigma) where 'net' is the EDMPrecond wrapper.
     """
     def __init__(self, P_mean: float = -1.2, P_std: float = 1.2,
-                 sigma_data: float = 0.5, noise_range=(None, None), edm_weighting=False):
+                 sigma_data: float = 0.25, noise_range=(None, None), edm_weighting=False):
         self.P_mean = float(P_mean)
         self.P_std = float(P_std)
         self.sigma_data = float(sigma_data)
@@ -156,7 +154,7 @@ class EDMLossNoCond:
 
         y = images
         n = torch.randn_like(y) * sigma
-        D_yn = net(y + n)  # EDM-preconditioned forward
+        D_yn = net(y + n, noise_labels=sigma.flatten())  # EDM-preconditioned forward
         if self.edm_weighting:
         # EDM weighting
             weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2

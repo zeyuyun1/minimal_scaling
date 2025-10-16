@@ -16,7 +16,7 @@ from torchvision.datasets import ImageFolder
 from pytorch_lightning.utilities import rank_zero_only
 from torchvision.utils import make_grid
 
-from model import RecurrentConvNLayer,UNetBlind64,RecurrentConvNLayer2,RecurrentConvNLayer3,RecurrentConvNLayer_cc
+from model import RecurrentConvNLayer,UNetBlind64,RecurrentConvNLayer2,RecurrentConvNLayer3,RecurrentConvNLayer_cc,OneLayerAE_MinWithNoise,RecurrentOneLayer,RecurrentOneLayer_stable,RecurrentOneLayer_reuse
 from torch.optim.lr_scheduler import LambdaLR
 import wandb
 import numpy as np
@@ -31,8 +31,74 @@ def _endswith_lookup(state_dict, suffix):
             return k
     return None
 
+
 @torch.no_grad()
-def load_ff_encoders_from_checkpoint(lit_module, ckpt_path, copy_outer_encoder=True, strict_shape=True):
+def _zero_module_weights_(mod: nn.Module, zero_bias: bool = True):
+    """Zero conv/linear weights (handles spectral_norm's weight_orig if present)."""
+    if hasattr(mod, "weight_orig"):   # spectral_norm / parametrizations
+        mod.weight_orig.zero_()
+        if hasattr(mod, "weight_v"):  # power-iter vector; keep it normalized
+            mod.weight_v.normal_().div_(mod.weight_v.norm() + 1e-9)
+    if hasattr(mod, "weight") and mod.weight is not None:
+        mod.weight.zero_()
+    if zero_bias and hasattr(mod, "bias") and mod.bias is not None:
+        mod.bias.zero_()
+
+@torch.no_grad()
+def erase_all_M_weights(obj, zero_bias: bool = True, freeze: bool = False, verbose: bool = True) -> int:
+    """
+    Zero out every recurrent 'M' matrix in the model.
+    Works if you pass a LightningModule (with .model/.ema_model) or a plain nn.Module.
+
+    Args:
+        obj: LightningModule or nn.Module
+        zero_bias: also zero M.bias if it exists
+        freeze: set requires_grad=False for all parameters in M
+        verbose: print how many were zeroed
+
+    Returns:
+        Number of 'M' modules zeroed.
+    """
+    # resolve root model(s)
+    roots = []
+    if isinstance(obj, nn.Module) and hasattr(obj, "model"):
+        roots.append(obj.model)
+        # also do EMA if present
+        if hasattr(obj, "ema_model") and isinstance(obj.ema_model, nn.Module):
+            roots.append(obj.ema_model)
+    elif isinstance(obj, nn.Module):
+        roots.append(obj)
+    else:
+        raise TypeError("erase_all_M_weights expects a LightningModule or nn.Module.")
+    total = 0
+    for root in roots:
+        # Preferred: iterate levels if present (fast and explicit)
+        if hasattr(root, "levels"):
+            for i, lev in enumerate(root.levels):
+                if hasattr(lev, "M") and isinstance(lev.M, nn.Module):
+                    _zero_module_weights_(lev.M, zero_bias=zero_bias)
+                    if freeze:
+                        for p in lev.M.parameters():
+                            p.requires_grad = False
+                    total += 1
+        else:
+            # Fallback: scan named submodules for anything literally named 'M'
+            for name, mod in root.named_modules():
+                if name.split(".")[-1] == "M" and isinstance(mod, nn.Module):
+                    _zero_module_weights_(mod, zero_bias=zero_bias)
+                    if freeze:
+                        for p in mod.parameters():
+                            p.requires_grad = False
+                    total += 1
+
+    if verbose:
+        print(f"[erase_all_M_weights] zeroed {total} recurrent M module(s).")
+    return total
+
+
+
+@torch.no_grad()
+def load_ff_encoders_from_checkpoint(lit_module, ckpt_path, copy_outer_encoder=True, copy_outer_decoder=True, strict_shape=True):
     """
     Copy ONLY feed-forward encoder weights (and biases) into:
       - lit_module.model
@@ -43,6 +109,7 @@ def load_ff_encoders_from_checkpoint(lit_module, ckpt_path, copy_outer_encoder=T
         lit_module: your LightningModule (instance of LitDenoiser)
         ckpt_path:  path to .ckpt or .pth
         copy_outer_encoder: also copy model.encoder if present (whitening)
+        copy_outer_decoder: also copy model.decoder if present
         strict_shape: if True, only copy when shapes match exactly
     """
     ckpt = torch.load(ckpt_path, map_location="cpu")
@@ -70,6 +137,26 @@ def load_ff_encoders_from_checkpoint(lit_module, ckpt_path, copy_outer_encoder=T
                             root.encoder.bias.copy_(src_b)
                     break  # found one version
 
+        # (a2) copy outer decoder if requested
+        if copy_outer_decoder and hasattr(root, "decoder") and isinstance(root.decoder, nn.Module):
+            for suf in [".decoder.weight", ".decoder.conv.weight"]:
+                key = _endswith_lookup(sd, f"{suf}")
+                if key is None:
+                    # try common prefixes
+                    key = _endswith_lookup(sd, f".model{suf}") or _endswith_lookup(sd, f".model.model{suf}")
+                if key is not None:
+                    src_w = sd[key]
+                    if hasattr(root.decoder, "weight"):
+                        if (not strict_shape) or (root.decoder.weight.shape == src_w.shape):
+                            root.decoder.weight.copy_(src_w)
+                    # bias
+                    bkey = key.replace("weight", "bias")
+                    if hasattr(root.decoder, "bias") and (root.decoder.bias is not None) and (bkey in sd):
+                        src_b = sd[bkey]
+                        if (not strict_shape) or (root.decoder.bias.shape == src_b.shape):
+                            root.decoder.bias.copy_(src_b)
+                    break  # found one version
+
         # (b) per-level encoders of RecurrentConvUnit
         if not hasattr(root, "levels"):
             return
@@ -92,10 +179,10 @@ def load_ff_encoders_from_checkpoint(lit_module, ckpt_path, copy_outer_encoder=T
             if key is None:
                 # nothing found; skip this level
                 continue
-
             src_w = sd[key]
             if hasattr(lev.encoder, "weight"):
                 if (not strict_shape) or (lev.encoder.weight.shape == src_w.shape):
+                    print("loading {} layer".format(i), src_w.shape)
                     lev.encoder.weight.copy_(src_w)
             # bias if present
             bkey = key.replace("weight", "bias")
@@ -194,15 +281,15 @@ def add_noise(x, sigma, distribution: str = "uniform",
                 sigma_sample = sigma_sample.clamp_min(lo)
             if hi is not None:
                 sigma_sample = sigma_sample.clamp_max(hi)
-        return x + torch.randn_like(x) * sigma_sample
+        return x + torch.randn_like(x) * sigma_sample, sigma_sample.flatten()
 
     # default: uniform (your original behavior)
     if isinstance(sigma, (tuple, list)) and len(sigma) == 2:
         lo, hi = sigma
         sigma_sample = torch.rand(B, 1, 1, 1, device=device) * (hi - lo) + lo
-        return x + torch.randn_like(x) * sigma_sample
+        return x + torch.randn_like(x) * sigma_sample, sigma_sample.flatten()
     else:
-        return x + torch.randn_like(x) * float(sigma)
+        return x + torch.randn_like(x) * float(sigma), float(sigma)
 
 class EMACheckpointCallback(Callback):
     """Custom callback to save EMA model checkpoints."""
@@ -249,6 +336,10 @@ class LitDenoiser(pl.LightningModule):
         jfb_with_grad_iters: tuple = (1, 3),
         jfb_reuse_solution: bool = False,
         jfb_ddp_safe: bool = True,
+        whiten_dim: int = None,
+        learning_horizontal: bool = True,
+        stable: bool = False,
+        jfb_reuse_solution_rate: float = 0,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -296,6 +387,58 @@ class LitDenoiser(pl.LightningModule):
                 n_iters_intra=n_iters_intra,
                 # whiten_dim=16,
             )
+        elif model_arch == "AE":
+            self.model = OneLayerAE_MinWithNoise(
+                in_channels=in_channels,
+                num_basis=num_basis,
+                kernel_size=kernel_size,
+                stride=stride,
+                whiten_dim=whiten_dim,
+            )
+        elif model_arch == "SC":
+            if stable:
+                self.model = RecurrentOneLayer_stable(
+                    in_channels=in_channels,
+                    num_basis=num_basis,
+                    eta_base=eta_base,
+                    kernel_size=kernel_size,
+                    stride=stride,
+                    whiten_dim=whiten_dim,
+                    jfb_no_grad_iters=jfb_no_grad_iters,
+                    jfb_with_grad_iters=jfb_with_grad_iters,
+                    jfb_reuse_solution=jfb_reuse_solution,
+                    jfb_ddp_safe=jfb_ddp_safe,
+                    learning_horizontal=learning_horizontal,
+                )
+            else:
+                self.model = RecurrentOneLayer(
+                    in_channels=in_channels,
+                    num_basis=num_basis,
+                    eta_base=eta_base,
+                    kernel_size=kernel_size,
+                    stride=stride,
+                    whiten_dim=whiten_dim,
+                    jfb_no_grad_iters=jfb_no_grad_iters,
+                    jfb_with_grad_iters=jfb_with_grad_iters,
+                    jfb_reuse_solution=jfb_reuse_solution,
+                    jfb_ddp_safe=jfb_ddp_safe,
+                    learning_horizontal=learning_horizontal,
+                )
+        elif model_arch == "SC_reuse":
+            self.model = RecurrentOneLayer_reuse(
+                in_channels=in_channels,
+                num_basis=num_basis,
+                eta_base=eta_base,
+                kernel_size=kernel_size,
+                stride=stride,
+                whiten_dim=whiten_dim,
+                jfb_no_grad_iters=jfb_no_grad_iters,
+                jfb_with_grad_iters=jfb_with_grad_iters,
+                jfb_reuse_solution=jfb_reuse_solution,
+                jfb_ddp_safe=jfb_ddp_safe,
+                learning_horizontal=learning_horizontal,
+                jfb_reuse_solution_rate=jfb_reuse_solution_rate,
+            )
         else:
             self.model = RecurrentConvNLayer(
                 in_channels=in_channels,
@@ -332,6 +475,58 @@ class LitDenoiser(pl.LightningModule):
                 jfb_reuse_solution=jfb_reuse_solution,
                 jfb_ddp_safe=jfb_ddp_safe,
             )
+        elif model_arch == "AE":
+            self.ema_model = OneLayerAE_MinWithNoise(
+                in_channels=in_channels,
+                num_basis=num_basis,
+                kernel_size=kernel_size,
+                stride=stride,
+                whiten_dim=whiten_dim,
+            )
+        elif model_arch == "SC":
+            if stable:
+                self.ema_model = RecurrentOneLayer_stable(
+                    in_channels=in_channels,
+                    num_basis=num_basis,
+                    eta_base=eta_base,
+                    kernel_size=kernel_size,
+                    stride=stride,
+                    whiten_dim=whiten_dim,
+                    jfb_no_grad_iters=jfb_no_grad_iters,
+                    jfb_with_grad_iters=jfb_with_grad_iters,
+                    jfb_reuse_solution=jfb_reuse_solution,
+                    jfb_ddp_safe=jfb_ddp_safe,
+                    learning_horizontal=learning_horizontal,
+                )
+            else:
+                self.ema_model = RecurrentOneLayer(
+                    in_channels=in_channels,
+                    num_basis=num_basis,
+                    eta_base=eta_base,
+                    kernel_size=kernel_size,
+                    stride=stride,
+                    whiten_dim=whiten_dim,
+                    jfb_no_grad_iters=jfb_no_grad_iters,
+                    jfb_with_grad_iters=jfb_with_grad_iters,
+                    jfb_reuse_solution=jfb_reuse_solution,
+                    jfb_ddp_safe=jfb_ddp_safe,
+                    learning_horizontal=learning_horizontal,
+                )
+        elif model_arch == "SC_reuse":
+            self.ema_model = RecurrentOneLayer_reuse(
+                in_channels=in_channels,
+                num_basis=num_basis,
+                eta_base=eta_base,
+                kernel_size=kernel_size,
+                stride=stride,
+                whiten_dim=whiten_dim,
+                jfb_no_grad_iters=jfb_no_grad_iters,
+                jfb_with_grad_iters=jfb_with_grad_iters,
+                jfb_reuse_solution=jfb_reuse_solution,
+                jfb_ddp_safe=jfb_ddp_safe,
+                learning_horizontal=learning_horizontal,
+                jfb_reuse_solution_rate=jfb_reuse_solution_rate,
+            )
         else:
             self.ema_model = RecurrentConvNLayer(
                 in_channels=in_channels,
@@ -342,14 +537,15 @@ class LitDenoiser(pl.LightningModule):
                 stride=stride,
                 n_iters_intra=n_iters_intra,
             )
+        print("EMA",type(self.ema_model))
         # Copy initial parameters from main model to EMA model
         self.ema_model.load_state_dict(self.model.state_dict())
         # Freeze EMA model parameters (they will be updated via EMA, not gradients)
         for param in self.ema_model.parameters():
             param.requires_grad = False
 
-    def forward(self, x):
-        return self.model(x)
+    def forward(self, x, noise_labels=None):
+        return self.model(x, noise_labels)
 
     def training_step(self, batch, batch_idx):
         x, _ = batch
@@ -381,12 +577,12 @@ class LitDenoiser(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         x, _ = batch
-        x_in = add_noise(x, self.hparams.sigma)
+        x_in, noise_labels = add_noise(x, self.hparams.sigma)
         # x_in = add_noise(x, self.hparams.sigma,distribution="edm",P_mean=self.hparams.P_mean,P_std=self.hparams.P_std)
         
         # Use EMA model for validation (better performance)
         with torch.no_grad():
-            x_hat = self.ema_model(x_in)
+            x_hat = self.ema_model(x_in, noise_labels=noise_labels)
     
         # compute batch signal and noise power
         sig_pow   = torch.sum(x ** 2)
@@ -424,7 +620,17 @@ class LitDenoiser(pl.LightningModule):
 
         # ---- layer-1 filters ----
         # w2: [out_c, in_c, kh, kw]
-        w2 = root.levels[0].decoder.conv.weight.detach()
+        model_arch = self.hparams.model_arch
+        if model_arch == "AE":
+            w2 = root.D1.weight.detach()
+            if self.hparams.whiten_dim is not None:
+                with torch.no_grad():
+                    w2 = root.dec0(w2).cpu()
+        else:
+            w2 = root.levels[0].decoder.conv.weight.detach()
+            if self.hparams.whiten_dim is not None:
+                with torch.no_grad():
+                    w2 = root.decoder(w2).cpu()
         # with torch.no_grad():
         #     w2 = root.decoder(w2).cpu()
         # .cpu()
@@ -522,6 +728,8 @@ if __name__ == "__main__":
                         help="Target image size for resizing/cropping (square). Ignored if --no_resize.")
     parser.add_argument("--no_resize", action="store_true", default=False,
                         help="Disable resize/center-crop in the dataloader transforms.")
+    parser.add_argument("--resize_size", type=int, default=512,
+                        help="Resize size for the dataloader transforms.")
     parser.add_argument("--random_crop", action="store_true", default=False,
                         help="Use RandomCrop(img_size) instead of CenterCrop. If --no_resize is set, only crop.")
     # EDM noise distribution parameters
@@ -547,10 +755,20 @@ if __name__ == "__main__":
                         help="Comma-separated list for number of with-grad iterations for each layer, e.g. '1,3'.")
     parser.add_argument("--jfb_reuse_solution", action="store_true", default=False,
                         help="Use reuse solution for JFB (default: False)")
-    parser.add_argument("--jfb_ddp_safe", action="store_true", default=True,
+    parser.add_argument("--jfb_ddp_safe", action="store_true", default=False,
                         help="Use DDP-safe JFB (default: True)")
     parser.add_argument("--load_all_weights", action="store_true", default=False,
                         help="Load all weights from checkpoint (default: False)")
+    parser.add_argument("--whiten_dim", type=int, default=None,
+                        help="Whiten dimension for AE (default: None)")
+    parser.add_argument("--no_learning_horizontal", action="store_true", default=False,
+                        help="No learning horizontal for gram (default: False)")
+    parser.add_argument("--zero_M_weights", action="store_true", default=False,
+                        help="Zero M weights (default: False)")
+    parser.add_argument("--stable", action="store_true", default=False,
+                        help="Stable model (default: False)")
+    parser.add_argument("--jfb_reuse_solution_rate", type=float, default=0,
+                        help="JFB reuse solution rate (default: 0)")
     args = parser.parse_args()
     
     # Set up experiment directory with index to avoid collisions
@@ -638,6 +856,10 @@ if __name__ == "__main__":
         jfb_with_grad_iters=args.jfb_with_grad_iters,
         jfb_reuse_solution=args.jfb_reuse_solution,
         jfb_ddp_safe=args.jfb_ddp_safe,
+        whiten_dim=args.whiten_dim,
+        learning_horizontal=not args.no_learning_horizontal,
+        stable=args.stable,
+        jfb_reuse_solution_rate=args.jfb_reuse_solution_rate,
     )
     
     # Load checkpoint if specified
@@ -710,10 +932,17 @@ if __name__ == "__main__":
                 # If no EMA weights in checkpoint, copy from main model
                 model.ema_model.load_state_dict(model.model.state_dict())
                 print("Initialized EMA model with main model weights")
+            if args.zero_M_weights:
+                erase_all_M_weights(model, zero_bias=True, freeze=False, verbose=True)
         else:
             print("Loading ONLY feed-forward encoders from: {args.checkpoint_path}")
-            load_ff_encoders_from_checkpoint(model, args.checkpoint_path,
-                                            copy_outer_encoder=True, strict_shape=True)
+            load_ff_encoders_from_checkpoint(
+                model,
+                args.checkpoint_path,
+                copy_outer_encoder=True,
+                copy_outer_decoder=True,
+                strict_shape=True,
+            )
             renorm_ff_stack_(model.model, mode="kaiming")
             renorm_ff_stack_(model.ema_model, mode="kaiming")
             print("Checkpoint loading completed successfully!")
@@ -737,6 +966,7 @@ if __name__ == "__main__":
             seed=42,
             grayscale=args.grayscale,
             no_resize=args.no_resize,
+            # resize_size=args.resize_size,
             random_crop=args.random_crop,
         )
 
