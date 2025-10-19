@@ -124,7 +124,8 @@ class TiedTransposeConv(nn.Module):
             bias=None,
             stride=self.conv.stride,
             padding=self.conv.padding,
-            output_padding=self.output_padding
+            output_padding=self.output_padding,
+            groups=self.conv.groups
         )
 
 ###############################################################################
@@ -282,7 +283,7 @@ class RecurrentConvUnit_gram(nn.Module):
       - top_signal is a top-down feedback signal.
     """
     def __init__(self, in_channels, num_basis, kernel_size=7, stride=2,
-                 padding=3, eta=0.5, init_lambda=0.1, output_padding=1,learning_horizontal=True):
+                 padding=3, eta=0.5, init_lambda=0.1, output_padding=1,learning_horizontal=True, groups=1):
         super(RecurrentConvUnit_gram, self).__init__()
         # Convolutional dictionary encoder.
         self.encoder = nn.Conv2d(
@@ -290,7 +291,8 @@ class RecurrentConvUnit_gram(nn.Module):
             kernel_size=kernel_size,
             stride=stride,
             padding=padding,
-            bias=True
+            bias=True,
+            groups=groups,
         )
         nn.init.constant_(self.encoder.bias, -init_lambda)
         if learning_horizontal:
@@ -300,6 +302,7 @@ class RecurrentConvUnit_gram(nn.Module):
                 kernel_size=3,
                 padding =1,
                 bias=False,
+                groups=groups,
                 # groups=num_basis//4
             )
             # torch.nn.init.dirac_(self.M.weight)
@@ -1605,9 +1608,13 @@ class RecurrentOneLayer_reuse(nn.Module):
     learning_horizontal=True,eta_base=0.1,
     jfb_no_grad_iters=None,jfb_with_grad_iters=None,
     jfb_reuse_solution_rate=0,jfb_ddp_safe=True,
-    channel_mult_emb=2,channel_mult_noise=1,jfb_reuse_solution=0,mixer_value=0.0):
+    channel_mult_emb=2,channel_mult_noise=1,jfb_reuse_solution=0,mixer_value=0.0, frequency_groups=None):
         super().__init__()
         self.eta_base = eta_base
+        # if frequency_groups is None:
+        #     self.frequency_groups = in_channels
+        # else:
+        #     self.frequency_groups = frequency_groups
         # Default JFB tuples if None
         self.jfb_no_grad_iters = (0, 6) if jfb_no_grad_iters is None else tuple(jfb_no_grad_iters)
         self.jfb_with_grad_iters = (1, 3) if jfb_with_grad_iters is None else tuple(jfb_with_grad_iters)
@@ -1620,12 +1627,16 @@ class RecurrentOneLayer_reuse(nn.Module):
             self.encoder = Conv2d(in_channels, whiten_dim, kernel=3)
             self.decoder = Conv2d(whiten_dim, in_channels, kernel=3)
             prev_channels = whiten_dim
+            if frequency_groups is not None:
+                G = prev_channels//frequency_groups
+            else:
+                G = 1
         else:
             self.encoder = nn.Identity()
             self.decoder = nn.Identity()
             prev_channels = in_channels
         self.levels = nn.ModuleList([
-            RecurrentConvUnit_gram(prev_channels,num_basis[0],kernel_size=kernel_size,eta=eta_base,stride=stride,output_padding=output_padding,learning_horizontal=learning_horizontal)
+            RecurrentConvUnit_gram(prev_channels,num_basis[0],kernel_size=kernel_size,eta=eta_base,stride=stride,output_padding=output_padding,learning_horizontal=learning_horizontal, groups=G)
         ])
         self.n_levels=1
 

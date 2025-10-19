@@ -340,6 +340,7 @@ class LitDenoiser(pl.LightningModule):
         learning_horizontal: bool = True,
         stable: bool = False,
         jfb_reuse_solution_rate: float = 0,
+        frequency_groups: int = None,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -438,6 +439,7 @@ class LitDenoiser(pl.LightningModule):
                 jfb_ddp_safe=jfb_ddp_safe,
                 learning_horizontal=learning_horizontal,
                 jfb_reuse_solution_rate=jfb_reuse_solution_rate,
+                frequency_groups=frequency_groups,
             )
         else:
             self.model = RecurrentConvNLayer(
@@ -526,6 +528,7 @@ class LitDenoiser(pl.LightningModule):
                 jfb_ddp_safe=jfb_ddp_safe,
                 learning_horizontal=learning_horizontal,
                 jfb_reuse_solution_rate=jfb_reuse_solution_rate,
+                frequency_groups=frequency_groups,
             )
         else:
             self.ema_model = RecurrentConvNLayer(
@@ -621,16 +624,18 @@ class LitDenoiser(pl.LightningModule):
         # ---- layer-1 filters ----
         # w2: [out_c, in_c, kh, kw]
         model_arch = self.hparams.model_arch
-        if model_arch == "AE":
-            w2 = root.D1.weight.detach()
-            if self.hparams.whiten_dim is not None:
-                with torch.no_grad():
+        with torch.no_grad():
+            if model_arch == "AE":
+                w2 = root.D1.weight.detach()
+                if self.hparams.whiten_dim is not None:
                     w2 = root.dec0(w2).cpu()
-        else:
-            w2 = root.levels[0].decoder.conv.weight.detach()
-            if self.hparams.whiten_dim is not None:
-                with torch.no_grad():
-                    w2 = root.decoder(w2).cpu()
+            else:
+                w2 = root.levels[0].decoder.conv.weight.detach()
+                if self.hparams.whiten_dim is not None:
+                    if self.hparams.frequency_groups is not None:
+                        pass
+                    else:
+                        w2 = root.decoder(w2).cpu()
         # with torch.no_grad():
         #     w2 = root.decoder(w2).cpu()
         # .cpu()
@@ -769,6 +774,8 @@ if __name__ == "__main__":
                         help="Stable model (default: False)")
     parser.add_argument("--jfb_reuse_solution_rate", type=float, default=0,
                         help="JFB reuse solution rate (default: 0)")
+    parser.add_argument("--frequency_groups", type=int, default=None,
+                        help="Frequency groups (default: None)")
     args = parser.parse_args()
     
     # Set up experiment directory with index to avoid collisions
@@ -860,6 +867,7 @@ if __name__ == "__main__":
         learning_horizontal=not args.no_learning_horizontal,
         stable=args.stable,
         jfb_reuse_solution_rate=args.jfb_reuse_solution_rate,
+        frequency_groups=args.frequency_groups,
     )
     
     # Load checkpoint if specified

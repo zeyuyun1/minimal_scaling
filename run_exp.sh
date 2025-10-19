@@ -422,8 +422,6 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 python main.py --gpus 4 --project_name scaling-VH-n
  
 
 
-
-
 # straighten non horizontal model
 python main.py --gpus 4 --project_name scaling-VH-new --batch_size 64 --n_epochs 1000 --lr 1e-4 --exp_name layer1-SC-whiten-1-noise-labels-zero-scratch-weighting-straighten \
  --model_arch SC --in_channels 1 --num_basis 128 --sigma 0.01,0.5 --P_mean=-1.6 --P_std=0.7 --data_dir /home/zeyu/vanhateren_all/vh_patches256_train/ --grayscale \
@@ -431,15 +429,65 @@ python main.py --gpus 4 --project_name scaling-VH-new --batch_size 64 --n_epochs
  --load_all_weights --checkpoint_path pretrained_model/scaling-VH-new/00061_layer1-SC-whiten-1-noise-labels-zero-scratch-weighting/denoiser.ckpt
 
 
-# python main.py --gpus 4 --project_name scaling-VH-new --batch_size 64 --n_epochs 1000  \
-# --lr 1e-4 --exp_name layer1-ae-whiten-noise-emb-edm-weight --model_arch SC --in_channels 1  \
-# --num_basis 128 --sigma 0.01,0.5 --P_mean=-1.6 --P_std=0.7 --data_dir /home/zeyu/vanhateren_all/vh_patches256_train/ \
-# --grayscale --img_size 128 --random_crop --whiten_dim 16 --kernel_size 7 --jfb_no_grad_iters 0,0 \
-# --jfb_with_grad_iters 1,1 --eta_base 1.0 --no_learning_horizontal
 
 
-#  --edm_weighting
-# --edm_weighting
+
+# Group Conv experiment
+CUDA_VISIBLE_DEVICES=4,5,6,7 python main.py --gpus 4 --project_name scaling-VH-new --batch_size 64 --n_epochs 1000 \
+--lr 1e-4 --exp_name layer1-SC-whiten-1-noise-labels-zero-scratch-horizontal-weighting-reuse \
+--model_arch SC_reuse --in_channels 1 --num_basis 128 --sigma 0.01,0.5 --P_mean=-1.6 --P_std=0.7 \
+--data_dir /home/zeyu/vanhateren_all/vh_patches256_train/ --grayscale --img_size 128 --random_crop \
+--whiten_dim 16 --kernel_size 7 --jfb_no_grad_iters 1,10 --jfb_with_grad_iters 1,3 --eta_base 0.1 --edm_weighting \
+--jfb_reuse_solution_rate 0.5
+
+
+
+
+# reuse + Safe + Smaller learning rate
+
+CUDA_VISIBLE_DEVICES=4,5,6,7 python main.py --gpus 4 --project_name scaling-VH-new-2 --batch_size 64 --n_epochs 1000 \
+--lr 1e-4 --exp_name layer1-SC-whiten-1-noise-labels-zero-scratch-reuse-no-whiten \
+--model_arch SC_reuse --in_channels 1 --num_basis 128 --sigma 0.01,0.5 --P_mean=-1.6 --P_std=0.7 \
+--data_dir /home/zeyu/vanhateren_all/vh_patches256_train/ --grayscale --img_size 128 --random_crop \
+--kernel_size 7 --jfb_no_grad_iters 1,10 --jfb_with_grad_iters 1,3 --eta_base 0.05 --edm_weighting \
+--jfb_reuse_solution_rate 0.3 --no_learning_horizontal
+
+
+
+python main.py --gpus 4 --project_name scaling-VH-new-2 --batch_size 64 --n_epochs 1000 \
+--lr 1e-4 --exp_name layer1-SC-whiten-1-noise-labels-zero-scratch-reuse \
+--model_arch SC_reuse --in_channels 1 --num_basis 128 --sigma 0.01,0.5 --P_mean=-1.6 --P_std=0.7 \
+--data_dir /home/zeyu/vanhateren_all/vh_patches256_train/ --grayscale --img_size 128 --random_crop \
+--whiten_dim 16 --kernel_size 7 --jfb_no_grad_iters 1,10 --jfb_with_grad_iters 1,3 --eta_base 0.05 --edm_weighting \
+--jfb_reuse_solution_rate 0.3 --no_learning_horizontal
+
+
+
+CUDA_VISIBLE_DEVICES=4,5,6,7 python main.py --gpus 4 --project_name scaling-VH-new-2 --batch_size 64 --n_epochs 1000 \
+--lr 1e-4 --exp_name layer1-SC-whiten-1-noise-labels-zero-scratch-reuse-fgroups-4 \
+--model_arch SC_reuse --in_channels 1 --num_basis 128 --sigma 0.01,0.5 --P_mean=-1.6 --P_std=0.7 \
+--data_dir /home/zeyu/vanhateren_all/vh_patches256_train/ --grayscale --img_size 128 --random_crop \
+--whiten_dim 16 --kernel_size 7 --jfb_no_grad_iters 1,10 --jfb_with_grad_iters 1,3 --eta_base 0.05 --edm_weighting \
+--jfb_reuse_solution_rate 0.3 --no_learning_horizontal --frequency_groups 4
+
+
+CUDA_VISIBLE_DEVICES=4,5,6,7 python main.py --gpus 4 --project_name scaling-VH-new-2 --batch_size 64 --n_epochs 1000 \
+--lr 1e-4 --exp_name layer1-SC-whiten-1-noise-labels-zero-scratch-reuse-fgroups-4 \
+--model_arch SC_reuse --in_channels 1 --num_basis 256 --sigma 0.01,0.5 --P_mean=-1.6 --P_std=0.7 \
+--data_dir /home/zeyu/vanhateren_all/vh_patches256_train/ --grayscale --img_size 128 --random_crop \
+--whiten_dim 16 --kernel_size 7 --jfb_no_grad_iters 1,10 --jfb_with_grad_iters 1,3 --eta_base 0.05 --edm_weighting \
+--jfb_reuse_solution_rate 0.3 --no_learning_horizontal --frequency_groups 8
+
+
+
+# extreme
+CUDA_VISIBLE_DEVICES=4,5,6,7 python main.py --gpus 4 --project_name scaling-VH-new-2 --batch_size 64 --n_epochs 1000 \
+--lr 1e-4 --exp_name layer1-SC-whiten-1-noise-labels-zero-scratch-reuse-fgroups-2 \
+--model_arch SC_reuse --in_channels 1 --num_basis 256 --sigma 0.01,0.5 --P_mean=-1.6 --P_std=0.7 \
+--data_dir /home/zeyu/vanhateren_all/vh_patches256_train/ --grayscale --img_size 128 --random_crop \
+--whiten_dim 16 --kernel_size 7 --jfb_no_grad_iters 1,10 --jfb_with_grad_iters 1,3 --eta_base 0.05 --edm_weighting \
+--jfb_reuse_solution_rate 0.3 --no_learning_horizontal --frequency_groups 2
+
 
 
 

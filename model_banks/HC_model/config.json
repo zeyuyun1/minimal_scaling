@@ -1,0 +1,55 @@
+{
+    "project_name": "scaling-VH-new",
+    "exp_name": "layer1-SC-whiten-1-noise-labels-zero-scratch-horizontal-weighting-straighten-from-reuse",
+    "config_file": null,
+    "config_dir": "configs",
+    "data_dir": "/home/zeyu/vanhateren_all/vh_patches256_train/",
+    "gpus": 4,
+    "batch_size": 64,
+    "n_epochs": 1000,
+    "lr": 0.0001,
+    "checkpoint_dir": "checkpoints",
+    "in_channels": 1,
+    "num_basis": [
+        128
+    ],
+    "eta_base": 0.1,
+    "n_iters_inter": 3,
+    "kernel_size": 7,
+    "stride": 2,
+    "n_iters_intra": 1,
+    "sigma": [
+        0.01,
+        0.5
+    ],
+    "model_arch": "SC_reuse",
+    "dataset": "celeba",
+    "grayscale": true,
+    "img_size": 128,
+    "no_resize": false,
+    "resize_size": 512,
+    "random_crop": true,
+    "P_mean": -1.6,
+    "P_std": 0.7,
+    "edm_weighting": true,
+    "ema_halflife_kimg": 500.0,
+    "ema_rampup_ratio": 0.05,
+    "checkpoint_path": "pretrained_model/scaling-VH-new/00086_layer1-SC-whiten-1-noise-labels-zero-scratch-horizontal-weighting-reuse/denoiser.ckpt",
+    "eta_ls": null,
+    "jfb_no_grad_iters": [
+        4,
+        20
+    ],
+    "jfb_with_grad_iters": [
+        1,
+        5
+    ],
+    "jfb_reuse_solution": false,
+    "jfb_ddp_safe": false,
+    "load_all_weights": true,
+    "whiten_dim": 16,
+    "no_learning_horizontal": false,
+    "zero_M_weights": false,
+    "stable": false,
+    "jfb_reuse_solution_rate": 0.5
+}
