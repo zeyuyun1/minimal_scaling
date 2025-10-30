@@ -16,231 +16,19 @@ from torchvision.datasets import ImageFolder
 from pytorch_lightning.utilities import rank_zero_only
 from torchvision.utils import make_grid
 
-from model import RecurrentConvNLayer,UNetBlind64,RecurrentConvNLayer2,RecurrentConvNLayer3
-from model import RecurrentConvNLayer_cc,OneLayerAE_MinWithNoise,RecurrentOneLayer,RecurrentOneLayer_stable,RecurrentOneLayer_reuse,RecurrentOneLayer_DEQ
+from model import OneLayerAE_MinWithNoise
 from torch.optim.lr_scheduler import LambdaLR
 import wandb
 import numpy as np
 import math
-
-import torch
-from torch import nn
-
-def _endswith_lookup(state_dict, suffix):
-    for k in state_dict.keys():
-        if k.endswith(suffix):
-            return k
-    return None
+# Import from our new modules
+from utils import warmup_fn, vis_patches
+from loss import EDMLossNoCond, SimpleUniformNoiseLoss
+from data import ImageDataModule, MNISTDataModule
 
 
-@torch.no_grad()
-def _zero_module_weights_(mod: nn.Module, zero_bias: bool = True):
-    """Zero conv/linear weights (handles spectral_norm's weight_orig if present)."""
-    if hasattr(mod, "weight_orig"):   # spectral_norm / parametrizations
-        mod.weight_orig.zero_()
-        if hasattr(mod, "weight_v"):  # power-iter vector; keep it normalized
-            mod.weight_v.normal_().div_(mod.weight_v.norm() + 1e-9)
-    if hasattr(mod, "weight") and mod.weight is not None:
-        mod.weight.zero_()
-    if zero_bias and hasattr(mod, "bias") and mod.bias is not None:
-        mod.bias.zero_()
-
-@torch.no_grad()
-def erase_all_M_weights(obj, zero_bias: bool = True, freeze: bool = False, verbose: bool = True) -> int:
-    """
-    Zero out every recurrent 'M' matrix in the model.
-    Works if you pass a LightningModule (with .model/.ema_model) or a plain nn.Module.
-
-    Args:
-        obj: LightningModule or nn.Module
-        zero_bias: also zero M.bias if it exists
-        freeze: set requires_grad=False for all parameters in M
-        verbose: print how many were zeroed
-
-    Returns:
-        Number of 'M' modules zeroed.
-    """
-    # resolve root model(s)
-    roots = []
-    if isinstance(obj, nn.Module) and hasattr(obj, "model"):
-        roots.append(obj.model)
-        # also do EMA if present
-        if hasattr(obj, "ema_model") and isinstance(obj.ema_model, nn.Module):
-            roots.append(obj.ema_model)
-    elif isinstance(obj, nn.Module):
-        roots.append(obj)
-    else:
-        raise TypeError("erase_all_M_weights expects a LightningModule or nn.Module.")
-    total = 0
-    for root in roots:
-        # Preferred: iterate levels if present (fast and explicit)
-        if hasattr(root, "levels"):
-            for i, lev in enumerate(root.levels):
-                if hasattr(lev, "M") and isinstance(lev.M, nn.Module):
-                    _zero_module_weights_(lev.M, zero_bias=zero_bias)
-                    if freeze:
-                        for p in lev.M.parameters():
-                            p.requires_grad = False
-                    total += 1
-        else:
-            # Fallback: scan named submodules for anything literally named 'M'
-            for name, mod in root.named_modules():
-                if name.split(".")[-1] == "M" and isinstance(mod, nn.Module):
-                    _zero_module_weights_(mod, zero_bias=zero_bias)
-                    if freeze:
-                        for p in mod.parameters():
-                            p.requires_grad = False
-                    total += 1
-
-    if verbose:
-        print(f"[erase_all_M_weights] zeroed {total} recurrent M module(s).")
-    return total
-
-
-
-@torch.no_grad()
-def load_ff_encoders_from_checkpoint(lit_module, ckpt_path, copy_outer_encoder=True, copy_outer_decoder=True, strict_shape=True):
-    """
-    Copy ONLY feed-forward encoder weights (and biases) into:
-      - lit_module.model
-      - lit_module.ema_model
-    from a checkpoint file that may be a PL checkpoint or a raw state_dict.
-
-    Args:
-        lit_module: your LightningModule (instance of LitDenoiser)
-        ckpt_path:  path to .ckpt or .pth
-        copy_outer_encoder: also copy model.encoder if present (whitening)
-        copy_outer_decoder: also copy model.decoder if present
-        strict_shape: if True, only copy when shapes match exactly
-    """
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-    sd = ckpt.get("state_dict", ckpt)  # PL or raw
-
-    def _copy_into(target_model):
-        root = getattr(target_model, "model", target_model)  # in case of nested
-        # (a) copy outer whitening encoder if requested
-        if copy_outer_encoder and hasattr(root, "encoder") and isinstance(root.encoder, nn.Module):
-            for suf in [".encoder.weight", ".encoder.conv.weight"]:
-                key = _endswith_lookup(sd, f"{suf}")
-                if key is None:
-                    # try common prefixes
-                    key = _endswith_lookup(sd, f".model{suf}") or _endswith_lookup(sd, f".model.model{suf}")
-                if key is not None:
-                    src_w = sd[key]
-                    if hasattr(root.encoder, "weight"):
-                        if (not strict_shape) or (root.encoder.weight.shape == src_w.shape):
-                            root.encoder.weight.copy_(src_w)
-                    # bias
-                    bkey = key.replace("weight", "bias")
-                    if hasattr(root.encoder, "bias") and (root.encoder.bias is not None) and (bkey in sd):
-                        src_b = sd[bkey]
-                        if (not strict_shape) or (root.encoder.bias.shape == src_b.shape):
-                            root.encoder.bias.copy_(src_b)
-                    break  # found one version
-
-        # (a2) copy outer decoder if requested
-        if copy_outer_decoder and hasattr(root, "decoder") and isinstance(root.decoder, nn.Module):
-            for suf in [".decoder.weight", ".decoder.conv.weight"]:
-                key = _endswith_lookup(sd, f"{suf}")
-                if key is None:
-                    # try common prefixes
-                    key = _endswith_lookup(sd, f".model{suf}") or _endswith_lookup(sd, f".model.model{suf}")
-                if key is not None:
-                    src_w = sd[key]
-                    if hasattr(root.decoder, "weight"):
-                        if (not strict_shape) or (root.decoder.weight.shape == src_w.shape):
-                            root.decoder.weight.copy_(src_w)
-                    # bias
-                    bkey = key.replace("weight", "bias")
-                    if hasattr(root.decoder, "bias") and (root.decoder.bias is not None) and (bkey in sd):
-                        src_b = sd[bkey]
-                        if (not strict_shape) or (root.decoder.bias.shape == src_b.shape):
-                            root.decoder.bias.copy_(src_b)
-                    break  # found one version
-
-        # (b) per-level encoders of RecurrentConvUnit
-        if not hasattr(root, "levels"):
-            return
-        for i, lev in enumerate(root.levels):
-            if not hasattr(lev, "encoder") or not isinstance(lev.encoder, nn.Module):
-                continue
-            # look for any of these suffixes in the ckpt:
-            suffixes = [
-                f".levels.{i}.encoder.weight",           # most common
-                f".model.levels.{i}.encoder.weight",     # PL prefix
-                f".model.model.levels.{i}.encoder.weight",
-            ]
-            key = None
-            for suf in suffixes:
-                key = _endswith_lookup(sd, suf)
-                if key: break
-            # fallback: suffix-only search
-            if key is None:
-                key = _endswith_lookup(sd, f".levels.{i}.encoder.weight")
-            if key is None:
-                # nothing found; skip this level
-                continue
-            src_w = sd[key]
-            if hasattr(lev.encoder, "weight"):
-                if (not strict_shape) or (lev.encoder.weight.shape == src_w.shape):
-                    print("loading {} layer".format(i), src_w.shape)
-                    lev.encoder.weight.copy_(src_w)
-            # bias if present
-            bkey = key.replace("weight", "bias")
-            if hasattr(lev.encoder, "bias") and (lev.encoder.bias is not None) and (bkey in sd):
-                src_b = sd[bkey]
-                if (not strict_shape) or (lev.encoder.bias.shape == src_b.shape):
-                    lev.encoder.bias.copy_(src_b)
-
-    # copy into main model
-    _copy_into(lit_module)
-    # copy into EMA model too
-    if hasattr(lit_module, "ema_model"):
-        _copy_into(lit_module.ema_model)
 
 import math, torch, torch.nn as nn, torch.nn.functional as F
-
-@torch.no_grad()
-def renorm_conv_to_kaiming_(conv: nn.Conv2d):
-    if not isinstance(conv, nn.Conv2d): return
-    w = conv.weight
-    fan_in = w.shape[1] * w.shape[2] * w.shape[3]
-    target_std = math.sqrt(2.0 / max(1, fan_in))
-    cur_std = w.std().clamp_min(1e-8)
-    scale = (target_std / cur_std).item()
-    w.mul_(scale)
-    # leave bias as-is
-
-@torch.no_grad()
-def spectral_rescale_conv2d_(conv: nn.Conv2d, x_shape=(1,1,64,64), target_sn=1.0, iters=10):
-    """One-time power iteration to estimate ||W||_2 and rescale to <= target_sn."""
-    if not isinstance(conv, nn.Conv2d): return
-    device = conv.weight.device
-    u = torch.randn(x_shape, device=device)
-    u = u / (u.norm() + 1e-9)
-    for _ in range(iters):
-        v = F.conv2d(u, conv.weight, stride=conv.stride, padding=conv.padding, dilation=conv.dilation, groups=conv.groups)
-        v = v / (v.norm() + 1e-9)
-        u = F.conv_transpose2d(v, conv.weight, stride=conv.stride, padding=conv.padding, dilation=conv.dilation, groups=conv.groups)
-        u = u / (u.norm() + 1e-9)
-    # Rayleigh quotient ≈ spectral norm
-    v = F.conv2d(u, conv.weight, stride=conv.stride, padding=conv.padding, dilation=conv.dilation, groups=conv.groups)
-    sn = v.norm().item()
-    if sn > 1e-8 and sn > target_sn:
-        conv.weight.mul_(target_sn / sn)
-
-def renorm_ff_stack_(root, mode="kaiming"):
-    # outer whitening (if any)
-    if hasattr(root, "encoder") and isinstance(root.encoder, nn.Conv2d):
-        if mode=="kaiming": renorm_conv_to_kaiming_(root.encoder)
-        else: spectral_rescale_conv2d_(root.encoder, target_sn=1.0)
-    # per level
-    for lev in getattr(root, "levels", []):
-        if hasattr(lev, "encoder") and isinstance(lev.encoder, nn.Conv2d):
-            if mode=="kaiming": renorm_conv_to_kaiming_(lev.encoder)
-            else: spectral_rescale_conv2d_(lev.encoder, target_sn=1.0)
-
-
 
 def _to_wandb_image(chw: torch.Tensor):
     """Convert CHW [0,1] → something wandb.Image likes."""
@@ -253,12 +41,6 @@ def _to_wandb_image(chw: torch.Tensor):
     else:
         # collapse funny channel counts (e.g., 16) to grayscale
         return wandb.Image(chw.mean(dim=0).numpy())
-
-# Import from our new modules
-from utils import warmup_fn, vis_patches
-from loss import EDMLossNoCond, SimpleUniformNoiseLoss, EDMStyleXPredLoss, SimpleNoiseLoss
-from data import SubsetWithTransform, ImageDataModule, MNISTDataModule
-
 
 def add_noise(x, sigma, distribution: str = "uniform",
               P_mean: float = -1.2, P_std: float = 1.2):
@@ -319,11 +101,8 @@ class LitDenoiser(pl.LightningModule):
         self,
         in_channels: int,
         num_basis: list,
-        eta_base: float,
-        n_iters_inter: int,
         kernel_size: int,
         stride: int,
-        n_iters_intra: int,
         lr: float = 1e-3,
         sigma=(0.1, 1.5),
         model_arch = "h_sparse",
@@ -333,278 +112,40 @@ class LitDenoiser(pl.LightningModule):
         P_std: float = 0.5,
         edm_weighting: bool = False,
         eta_ls: list = None,
-        jfb_no_grad_iters: tuple = (0, 6),
-        jfb_with_grad_iters: tuple = (1, 3),
-        jfb_reuse_solution: bool = False,
-        jfb_ddp_safe: bool = True,
         whiten_dim: int = None,
-        learning_horizontal: bool = True,
-        stable: bool = False,
-        jfb_reuse_solution_rate: float = 0,
-        frequency_groups: int = None,
-        init_lambda: float = 0.0,
-        whiten_ks: int = 3,
         noise_embedding: bool = True,
-        loss_type: str = "edm",
         bias: bool = True,
-        relu_6: bool = False,
     ):
         super().__init__()
         self.save_hyperparameters()
-        if loss_type == "uniform":
-            self.loss_obj = SimpleUniformNoiseLoss(noise_range=sigma)
-        else:
-            self.loss_obj = EDMLossNoCond(noise_range=sigma,sigma_data=0.25,P_mean=P_mean,P_std=P_std,edm_weighting=edm_weighting)
-        # self.loss_obj = SimpleUniformNoiseLoss(noise_range=sigma)
-        # self.loss_obj = EDMLossNoCond(noise_range=sigma,sigma_data=0.15)
-        # self.loss_obj = EDMLossNoCond(noise_range=sigma,sigma_data=0.15,P_mean=P_mean,P_std=P_std)
-        # self.loss_obj = EDMStyleXPredLoss(noise_range=sigma,sigma_data=0.25)
-        # self.loss_obj = SimpleNoiseLoss(noise_range=sigma,sigma_data=0.25,P_mean=-2,P_std=0.5,weighting='edm')
-        if model_arch == "unet":
-            self.model = UNetBlind64(
-                in_channels=in_channels,
-                num_basis=num_basis,
-                eta_base=eta_base,
-                n_iters_inter=n_iters_inter,
-                kernel_size=kernel_size,
-                stride=stride,
-                n_iters_intra=n_iters_intra
-            )
-        elif model_arch == "recur_new":
-            # print(eta_ls)
-            self.model = RecurrentConvNLayer3(
-                in_channels=in_channels,
-                num_basis=num_basis,
-                eta_base=eta_base,
-                # n_iters_inter=n_iters_inter,
-                kernel_size=kernel_size,
-                stride=stride,
-                eta_ls=eta_ls,
-                jfb_no_grad_iters=jfb_no_grad_iters,
-                jfb_with_grad_iters=jfb_with_grad_iters,
-                jfb_reuse_solution=jfb_reuse_solution,
-                jfb_ddp_safe=jfb_ddp_safe,
-                # n_iters_intra=n_iters_intra,
-                # whiten_dim=16,
-            )
-        elif model_arch == "recur_cc":
-            self.model = RecurrentConvNLayer_cc(
-                in_channels=in_channels,
-                num_basis=num_basis,
-                eta_base=eta_base,
-                n_iters_inter=n_iters_inter,
-                kernel_size=kernel_size,
-                stride=stride,
-                n_iters_intra=n_iters_intra,
-                # whiten_dim=16,
-            )
-        elif model_arch == "AE":
-            self.model = OneLayerAE_MinWithNoise(
-                in_channels=in_channels,
-                num_basis=num_basis,
-                kernel_size=kernel_size,
-                stride=stride,
-                whiten_dim=whiten_dim,
-                noise_embedding=noise_embedding,
-                bias=bias,
-            )
-        elif model_arch == "SC":
-            if stable:
-                self.model = RecurrentOneLayer_stable(
-                    in_channels=in_channels,
-                    num_basis=num_basis,
-                    eta_base=eta_base,
-                    kernel_size=kernel_size,
-                    stride=stride,
-                    whiten_dim=whiten_dim,
-                    jfb_no_grad_iters=jfb_no_grad_iters,
-                    jfb_with_grad_iters=jfb_with_grad_iters,
-                    jfb_reuse_solution=jfb_reuse_solution,
-                    jfb_ddp_safe=jfb_ddp_safe,
-                    learning_horizontal=learning_horizontal,
-                )
-            else:
-                self.model = RecurrentOneLayer(
-                    in_channels=in_channels,
-                    num_basis=num_basis,
-                    eta_base=eta_base,
-                    kernel_size=kernel_size,
-                    stride=stride,
-                    whiten_dim=whiten_dim,
-                    jfb_no_grad_iters=jfb_no_grad_iters,
-                    jfb_with_grad_iters=jfb_with_grad_iters,
-                    jfb_reuse_solution=jfb_reuse_solution,
-                    jfb_ddp_safe=jfb_ddp_safe,
-                    learning_horizontal=learning_horizontal,
-                )
-        elif model_arch == "SC_reuse":
-            self.model = RecurrentOneLayer_reuse(
-                in_channels=in_channels,
-                num_basis=num_basis,
-                eta_base=eta_base,
-                kernel_size=kernel_size,
-                stride=stride,
-                whiten_dim=whiten_dim,
-                jfb_no_grad_iters=jfb_no_grad_iters,
-                jfb_with_grad_iters=jfb_with_grad_iters,
-                jfb_reuse_solution=jfb_reuse_solution,
-                jfb_ddp_safe=jfb_ddp_safe,
-                learning_horizontal=learning_horizontal,
-                jfb_reuse_solution_rate=jfb_reuse_solution_rate,
-                frequency_groups=frequency_groups,
-                init_lambda=init_lambda,
-                whiten_ks=whiten_ks,
-                noise_embedding=noise_embedding,
-                bias=bias,
-                relu_6=relu_6,
-            )
-        elif model_arch == "SC_DEQ":
-            self.model = RecurrentOneLayer_DEQ(
-                in_channels=in_channels,
-                num_basis=num_basis,
-                eta_base=eta_base,
-                kernel_size=kernel_size,
-                stride=stride,
-                whiten_dim=whiten_dim,
-                jfb_with_grad_iters=jfb_with_grad_iters,
-                jfb_reuse_solution=jfb_reuse_solution,
-                jfb_ddp_safe=jfb_ddp_safe,
-                learning_horizontal=learning_horizontal,
-                jfb_reuse_solution_rate=jfb_reuse_solution_rate,
-                frequency_groups=frequency_groups,
-                init_lambda=init_lambda,
-                whiten_ks=whiten_ks,
-                noise_embedding=noise_embedding,
-                bias=bias,
-                relu_6=relu_6,
-            )
-        else:
-            self.model = RecurrentConvNLayer(
-                in_channels=in_channels,
-                num_basis=num_basis,
-                eta_base=eta_base,
-                n_iters_inter=n_iters_inter,
-                kernel_size=kernel_size,
-                stride=stride,
-                n_iters_intra=n_iters_intra,
-                # whiten_dim=16,
-            )
-        print(type(self.model))
-        # Initialize EMA model mirroring the selected architecture
-        if model_arch == "unet":
-            self.ema_model = UNetBlind64(
-                in_channels=in_channels,
-                num_basis=num_basis,
-                eta_base=eta_base,
-                n_iters_inter=n_iters_inter,
-                kernel_size=kernel_size,
-                stride=stride,
-                n_iters_intra=n_iters_intra,
-            )
-        elif model_arch == "recur_new":
-            self.ema_model = RecurrentConvNLayer3(
-                in_channels=in_channels,
-                num_basis=num_basis,
-                eta_base=eta_base,
-                kernel_size=kernel_size,
-                stride=stride,
-                eta_ls=eta_ls,
-                jfb_no_grad_iters=jfb_no_grad_iters,
-                jfb_with_grad_iters=jfb_with_grad_iters,
-                jfb_reuse_solution=jfb_reuse_solution,
-                jfb_ddp_safe=jfb_ddp_safe,
-            )
-        elif model_arch == "AE":
-            self.ema_model = OneLayerAE_MinWithNoise(
-                in_channels=in_channels,
-                num_basis=num_basis,
-                kernel_size=kernel_size,
-                stride=stride,
-                whiten_dim=whiten_dim,
-                noise_embedding=noise_embedding,
-                bias=bias,
-            )
-        elif model_arch == "SC":
-            if stable:
-                self.ema_model = RecurrentOneLayer_stable(
-                    in_channels=in_channels,
-                    num_basis=num_basis,
-                    eta_base=eta_base,
-                    kernel_size=kernel_size,
-                    stride=stride,
-                    whiten_dim=whiten_dim,
-                    jfb_no_grad_iters=jfb_no_grad_iters,
-                    jfb_with_grad_iters=jfb_with_grad_iters,
-                    jfb_reuse_solution=jfb_reuse_solution,
-                    jfb_ddp_safe=jfb_ddp_safe,
-                    learning_horizontal=learning_horizontal,
-                )
-            else:
-                self.ema_model = RecurrentOneLayer(
-                    in_channels=in_channels,
-                    num_basis=num_basis,
-                    eta_base=eta_base,
-                    kernel_size=kernel_size,
-                    stride=stride,
-                    whiten_dim=whiten_dim,
-                    jfb_no_grad_iters=jfb_no_grad_iters,
-                    jfb_with_grad_iters=jfb_with_grad_iters,
-                    jfb_reuse_solution=jfb_reuse_solution,
-                    jfb_ddp_safe=jfb_ddp_safe,
-                    learning_horizontal=learning_horizontal,
-                )
-        elif model_arch == "SC_reuse":
-            self.ema_model = RecurrentOneLayer_reuse(
-                in_channels=in_channels,
-                num_basis=num_basis,
-                eta_base=eta_base,
-                kernel_size=kernel_size,
-                stride=stride,
-                whiten_dim=whiten_dim,
-                jfb_no_grad_iters=jfb_no_grad_iters,
-                jfb_with_grad_iters=jfb_with_grad_iters,
-                jfb_reuse_solution=jfb_reuse_solution,
-                jfb_ddp_safe=jfb_ddp_safe,
-                learning_horizontal=learning_horizontal,
-                jfb_reuse_solution_rate=jfb_reuse_solution_rate,
-                frequency_groups=frequency_groups,
-                init_lambda=init_lambda,
-                whiten_ks=whiten_ks,
-                noise_embedding=noise_embedding,
-                bias=bias,
-                relu_6=relu_6,
-            )
-        elif model_arch == "SC_DEQ":
-            self.ema_model = RecurrentOneLayer_DEQ(
-                in_channels=in_channels,
-                num_basis=num_basis,
-                eta_base=eta_base,
-                kernel_size=kernel_size,
-                stride=stride,
-                whiten_dim=whiten_dim,
-                jfb_with_grad_iters=jfb_with_grad_iters,
-                jfb_reuse_solution=jfb_reuse_solution,
-                jfb_ddp_safe=jfb_ddp_safe,
-                learning_horizontal=learning_horizontal,
-                jfb_reuse_solution_rate=jfb_reuse_solution_rate,
-                frequency_groups=frequency_groups,
-                init_lambda=init_lambda,
-                whiten_ks=whiten_ks,
-                noise_embedding=noise_embedding,
-                bias=bias,
-                relu_6=relu_6,
-            )
-        else:
-            self.ema_model = RecurrentConvNLayer(
-                in_channels=in_channels,
-                num_basis=num_basis,
-                eta_base=eta_base,
-                n_iters_inter=n_iters_inter,
-                kernel_size=kernel_size,
-                stride=stride,
-                n_iters_intra=n_iters_intra,
-            )
-        print("EMA",type(self.ema_model))
+        self.loss_obj = SimpleUniformNoiseLoss(noise_range=sigma)
+        # self.loss_obj = EDMLossNoCond(
+        #     noise_range=sigma,
+        #     sigma_data=0.25,
+        #     P_mean=P_mean,
+        #     P_std=P_std,
+        #     edm_weighting=edm_weighting,
+        # )
+
+        # Single supported architecture: AE with noise embedding
+        self.model = OneLayerAE_MinWithNoise(
+            in_channels=in_channels,
+            num_basis=num_basis,
+            kernel_size=kernel_size,
+            stride=stride,
+            whiten_dim=whiten_dim,
+            noise_embedding=noise_embedding,
+            bias=bias,
+        )
+        self.ema_model = OneLayerAE_MinWithNoise(
+            in_channels=in_channels,
+            num_basis=num_basis,
+            kernel_size=kernel_size,
+            stride=stride,
+            whiten_dim=whiten_dim,
+            noise_embedding=noise_embedding,
+            bias=bias,
+        )
         # Copy initial parameters from main model to EMA model
         self.ema_model.load_state_dict(self.model.state_dict())
         # Freeze EMA model parameters (they will be updated via EMA, not gradients)
@@ -620,7 +161,6 @@ class LitDenoiser(pl.LightningModule):
         loss = per_pix.mean()
         self.log("train_loss", loss, on_step=False, on_epoch=True, sync_dist=True)        
         return loss
-
 
     def optimizer_step(self, *args, **kwargs):
         # perform the actual optimizer step first
@@ -693,16 +233,6 @@ class LitDenoiser(pl.LightningModule):
                 w2 = root.D1.weight.detach()
                 if self.hparams.whiten_dim is not None:
                     w2 = root.dec0(w2).cpu()
-            else:
-                w2 = root.levels[0].decoder.conv.weight.detach()
-                if self.hparams.whiten_dim is not None:
-                    if self.hparams.frequency_groups is not None:
-                        pass
-                    else:
-                        w2 = root.decoder(w2).cpu()
-        # with torch.no_grad():
-        #     w2 = root.decoder(w2).cpu()
-        # .cpu()
 
         out_c, in_c, kh, kw = w2.shape
         patches = w2.view(out_c, in_c, kh * kw)   # (B=out_c, C=in_c, P)
@@ -781,11 +311,8 @@ if __name__ == "__main__":
     parser.add_argument("--in_channels", type=int, default=1)
     parser.add_argument("--num_basis", type=lambda s: [int(item) for item in s.split(',')], default="64,64",
                         help="Comma-separated list for number of basis per layer, e.g. '64,64'.")
-    parser.add_argument("--eta_base", type=float, default=0.25)
-    parser.add_argument("--n_iters_inter", type=int, default=3)
     parser.add_argument("--kernel_size", type=int, default=5)
     parser.add_argument("--stride", type=int, default=2)
-    parser.add_argument("--n_iters_intra", type=int, default=1)
     parser.add_argument("--sigma", type=lambda s: tuple(map(float, s.split(','))), default="0.5,0.5",
                         help="Noise sigma as single float or range 'min,max'.")
     parser.add_argument("--model_arch", type=str, default="h_sparse")
@@ -813,45 +340,18 @@ if __name__ == "__main__":
                         help="EMA half-life in thousands of images (default: 500.0)")
     parser.add_argument("--ema_rampup_ratio", type=float, default=0.05,
                         help="EMA ramp-up ratio (default: 0.05)")
-    parser.add_argument("--checkpoint_path", type=str, default=None,
-                        help="Path to checkpoint file to load for initialization (e.g., 'pretrained_model/main/00001_experiment/denoiser.ckpt')")
     parser.add_argument("--eta_ls", type=lambda s: [float(item) for item in s.split(',')], default=None,
                         help="Comma-separated list for step size for each layer, e.g. '0.1,0.1'.")
-    # jfb_no_grad_iters
-    parser.add_argument("--jfb_no_grad_iters", type=lambda s: tuple(map(int, s.split(','))), default="0,6",
-                        help="Comma-separated list for number of no-grad iterations for each layer, e.g. '0,6'.")
-    parser.add_argument("--jfb_with_grad_iters", type=lambda s: tuple(map(int, s.split(','))), default="1,3",
-                        help="Comma-separated list for number of with-grad iterations for each layer, e.g. '1,3'.")
-    parser.add_argument("--jfb_reuse_solution", action="store_true", default=False,
-                        help="Use reuse solution for JFB (default: False)")
-    parser.add_argument("--jfb_ddp_safe", action="store_true", default=False,
-                        help="Use DDP-safe JFB (default: True)")
     parser.add_argument("--load_all_weights", action="store_true", default=False,
                         help="Load all weights from checkpoint (default: False)")
     parser.add_argument("--whiten_dim", type=int, default=None,
                         help="Whiten dimension for AE (default: None)")
-    parser.add_argument("--no_learning_horizontal", action="store_true", default=False,
-                        help="No learning horizontal for gram (default: False)")
     parser.add_argument("--zero_M_weights", action="store_true", default=False,
                         help="Zero M weights (default: False)")
-    parser.add_argument("--stable", action="store_true", default=False,
-                        help="Stable model (default: False)")
-    parser.add_argument("--jfb_reuse_solution_rate", type=float, default=0,
-                        help="JFB reuse solution rate (default: 0)")
-    parser.add_argument("--frequency_groups", type=int, default=None,
-                        help="Frequency groups (default: None)")
-    parser.add_argument("--init_lambda", type=float, default=0.0,
-                        help="Initial lambda for the model (default: 0.0)")
-    parser.add_argument("--whiten_ks", type=int, default=3,
-                        help="Whiten kernel size (default: 3)")
     parser.add_argument("--no_noise_embedding", action="store_true", default=False,
                         help="No noise embedding (default: False)")
-    parser.add_argument("--loss_type", type=str, choices=["edm", "uniform"], default="edm",
-                        help="Loss type (default: edm)")
     parser.add_argument("--no_bias", action="store_true", default=False,
                         help="No bias (default: False)")
-    parser.add_argument("--relu_6", action="store_true", default=False,
-                        help="Use ReLU6 (default: False)")
     args = parser.parse_args()
     
     # Set up experiment directory with index to avoid collisions
@@ -917,129 +417,25 @@ if __name__ == "__main__":
     # Prepare data and model
     # dm = MNISTDataModule(batch_size=args.batch_size)
     lr = args.lr*args.batch_size/64*args.gpus
-    # print(args.eta_ls)
+    
     model = LitDenoiser(
         in_channels=args.in_channels,
         num_basis=args.num_basis,
-        eta_base=args.eta_base,
-        n_iters_inter=args.n_iters_inter,
         kernel_size=args.kernel_size,
         stride=args.stride,
         lr=lr,
         sigma=args.sigma,
-        n_iters_intra=args.n_iters_intra,
         ema_halflife_kimg=args.ema_halflife_kimg,
         ema_rampup_ratio=args.ema_rampup_ratio,
         model_arch = args.model_arch,
         P_mean=args.P_mean,
         P_std=args.P_std,
         edm_weighting = args.edm_weighting,
-        eta_ls=args.eta_ls,
-        jfb_no_grad_iters=args.jfb_no_grad_iters,
-        jfb_with_grad_iters=args.jfb_with_grad_iters,
-        jfb_reuse_solution=args.jfb_reuse_solution,
-        jfb_ddp_safe=args.jfb_ddp_safe,
         whiten_dim=args.whiten_dim,
-        learning_horizontal=not args.no_learning_horizontal,
-        stable=args.stable,
-        jfb_reuse_solution_rate=args.jfb_reuse_solution_rate,
-        frequency_groups=args.frequency_groups,
-        init_lambda=args.init_lambda,
-        whiten_ks=args.whiten_ks,
         noise_embedding=not args.no_noise_embedding,
-        loss_type=args.loss_type,
         bias=not args.no_bias,
-        relu_6=args.relu_6,
+        eta_ls=args.eta_ls,
     )
-    
-    # Load checkpoint if specified
-    if args.checkpoint_path:
-        if args.load_all_weights:
-            if not os.path.exists(args.checkpoint_path):
-                raise FileNotFoundError(f"Checkpoint file not found: {args.checkpoint_path}")
-            
-            print(f"Loading checkpoint from: {args.checkpoint_path}")
-            checkpoint = torch.load(args.checkpoint_path, map_location='cpu')
-            
-            def fix_state_dict_keys(state_dict, prefix="model."):
-                """Fix state dict keys by adding the model prefix if needed"""
-                fixed_dict = {}
-                for key, value in state_dict.items():
-                    if key.startswith(prefix):
-                        # Already has the correct prefix
-                        fixed_dict[key] = value
-                    else:
-                        # Add the prefix
-                        fixed_dict[prefix + key] = value
-                return fixed_dict
-            
-            # Load the model state dict
-            if 'state_dict' in checkpoint:
-                # PyTorch Lightning checkpoint format
-                state_dict = checkpoint['state_dict']
-                # Try loading as-is first
-                try:
-                    model.load_state_dict(state_dict, strict=True)
-                    print("Loaded model weights from PyTorch Lightning checkpoint")
-                except RuntimeError as e:
-                    if "Missing key(s)" in str(e) or "Unexpected key(s)" in str(e):
-                        print("Key mismatch detected, attempting to fix keys...")
-                        # Try fixing keys by adding model prefix
-                        fixed_state_dict = fix_state_dict_keys(state_dict, "model.")
-                        model.load_state_dict(fixed_state_dict, strict=False)
-                        print("Loaded model weights with key fixes applied")
-                    else:
-                        raise e
-            else:
-                # Direct state dict format
-                try:
-                    model.load_state_dict(checkpoint, strict=True)
-                    print("Loaded model weights from state dict")
-                except RuntimeError as e:
-                    if "Missing key(s)" in str(e) or "Unexpected key(s)" in str(e):
-                        print("Key mismatch detected, attempting to fix keys...")
-                        # Try fixing keys by adding model prefix
-                        fixed_state_dict = fix_state_dict_keys(checkpoint, "model.")
-                        model.load_state_dict(fixed_state_dict, strict=False)
-                        print("Loaded model weights with key fixes applied")
-                    else:
-                        raise e
-            
-            # Also try to load EMA model if available
-            if 'ema_model' in checkpoint:
-                try:
-                    model.ema_model.load_state_dict(checkpoint['ema_model'], strict=True)
-                    print("Loaded EMA model weights from checkpoint")
-                except RuntimeError as e:
-                    if "Missing key(s)" in str(e) or "Unexpected key(s)" in str(e):
-                        print("EMA key mismatch detected, attempting to fix keys...")
-                        fixed_ema_dict = fix_state_dict_keys(checkpoint['ema_model'], "model.")
-                        model.ema_model.load_state_dict(fixed_ema_dict, strict=False)
-                        print("Loaded EMA model weights with key fixes applied")
-                    else:
-                        raise e
-            else:
-                # If no EMA weights in checkpoint, copy from main model
-                model.ema_model.load_state_dict(model.model.state_dict())
-                print("Initialized EMA model with main model weights")
-            if args.zero_M_weights:
-                erase_all_M_weights(model, zero_bias=True, freeze=False, verbose=True)
-        else:
-            print("Loading ONLY feed-forward encoders from: {args.checkpoint_path}")
-            load_ff_encoders_from_checkpoint(
-                model,
-                args.checkpoint_path,
-                copy_outer_encoder=True,
-                copy_outer_decoder=True,
-                strict_shape=True,
-            )
-            renorm_ff_stack_(model.model, mode="kaiming")
-            renorm_ff_stack_(model.ema_model, mode="kaiming")
-            print("Checkpoint loading completed successfully!")
-
-
-
-
     
     # Select DataModule based on dataset
     if args.dataset == "mnist":
