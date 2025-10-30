@@ -16,7 +16,8 @@ from torchvision.datasets import ImageFolder
 from pytorch_lightning.utilities import rank_zero_only
 from torchvision.utils import make_grid
 
-from model import RecurrentConvNLayer,UNetBlind64,RecurrentConvNLayer2,RecurrentConvNLayer3,RecurrentConvNLayer_cc,OneLayerAE_MinWithNoise,RecurrentOneLayer,RecurrentOneLayer_stable,RecurrentOneLayer_reuse
+from model import RecurrentConvNLayer,UNetBlind64,RecurrentConvNLayer2,RecurrentConvNLayer3
+from model import RecurrentConvNLayer_cc,OneLayerAE_MinWithNoise,RecurrentOneLayer,RecurrentOneLayer_stable,RecurrentOneLayer_reuse,RecurrentOneLayer_DEQ
 from torch.optim.lr_scheduler import LambdaLR
 import wandb
 import numpy as np
@@ -341,11 +342,20 @@ class LitDenoiser(pl.LightningModule):
         stable: bool = False,
         jfb_reuse_solution_rate: float = 0,
         frequency_groups: int = None,
+        init_lambda: float = 0.0,
+        whiten_ks: int = 3,
+        noise_embedding: bool = True,
+        loss_type: str = "edm",
+        bias: bool = True,
+        relu_6: bool = False,
     ):
         super().__init__()
         self.save_hyperparameters()
+        if loss_type == "uniform":
+            self.loss_obj = SimpleUniformNoiseLoss(noise_range=sigma)
+        else:
+            self.loss_obj = EDMLossNoCond(noise_range=sigma,sigma_data=0.25,P_mean=P_mean,P_std=P_std,edm_weighting=edm_weighting)
         # self.loss_obj = SimpleUniformNoiseLoss(noise_range=sigma)
-        self.loss_obj = EDMLossNoCond(noise_range=sigma,sigma_data=0.25,P_mean=P_mean,P_std=P_std,edm_weighting=edm_weighting)
         # self.loss_obj = EDMLossNoCond(noise_range=sigma,sigma_data=0.15)
         # self.loss_obj = EDMLossNoCond(noise_range=sigma,sigma_data=0.15,P_mean=P_mean,P_std=P_std)
         # self.loss_obj = EDMStyleXPredLoss(noise_range=sigma,sigma_data=0.25)
@@ -395,6 +405,8 @@ class LitDenoiser(pl.LightningModule):
                 kernel_size=kernel_size,
                 stride=stride,
                 whiten_dim=whiten_dim,
+                noise_embedding=noise_embedding,
+                bias=bias,
             )
         elif model_arch == "SC":
             if stable:
@@ -440,6 +452,31 @@ class LitDenoiser(pl.LightningModule):
                 learning_horizontal=learning_horizontal,
                 jfb_reuse_solution_rate=jfb_reuse_solution_rate,
                 frequency_groups=frequency_groups,
+                init_lambda=init_lambda,
+                whiten_ks=whiten_ks,
+                noise_embedding=noise_embedding,
+                bias=bias,
+                relu_6=relu_6,
+            )
+        elif model_arch == "SC_DEQ":
+            self.model = RecurrentOneLayer_DEQ(
+                in_channels=in_channels,
+                num_basis=num_basis,
+                eta_base=eta_base,
+                kernel_size=kernel_size,
+                stride=stride,
+                whiten_dim=whiten_dim,
+                jfb_with_grad_iters=jfb_with_grad_iters,
+                jfb_reuse_solution=jfb_reuse_solution,
+                jfb_ddp_safe=jfb_ddp_safe,
+                learning_horizontal=learning_horizontal,
+                jfb_reuse_solution_rate=jfb_reuse_solution_rate,
+                frequency_groups=frequency_groups,
+                init_lambda=init_lambda,
+                whiten_ks=whiten_ks,
+                noise_embedding=noise_embedding,
+                bias=bias,
+                relu_6=relu_6,
             )
         else:
             self.model = RecurrentConvNLayer(
@@ -484,6 +521,8 @@ class LitDenoiser(pl.LightningModule):
                 kernel_size=kernel_size,
                 stride=stride,
                 whiten_dim=whiten_dim,
+                noise_embedding=noise_embedding,
+                bias=bias,
             )
         elif model_arch == "SC":
             if stable:
@@ -529,6 +568,31 @@ class LitDenoiser(pl.LightningModule):
                 learning_horizontal=learning_horizontal,
                 jfb_reuse_solution_rate=jfb_reuse_solution_rate,
                 frequency_groups=frequency_groups,
+                init_lambda=init_lambda,
+                whiten_ks=whiten_ks,
+                noise_embedding=noise_embedding,
+                bias=bias,
+                relu_6=relu_6,
+            )
+        elif model_arch == "SC_DEQ":
+            self.ema_model = RecurrentOneLayer_DEQ(
+                in_channels=in_channels,
+                num_basis=num_basis,
+                eta_base=eta_base,
+                kernel_size=kernel_size,
+                stride=stride,
+                whiten_dim=whiten_dim,
+                jfb_with_grad_iters=jfb_with_grad_iters,
+                jfb_reuse_solution=jfb_reuse_solution,
+                jfb_ddp_safe=jfb_ddp_safe,
+                learning_horizontal=learning_horizontal,
+                jfb_reuse_solution_rate=jfb_reuse_solution_rate,
+                frequency_groups=frequency_groups,
+                init_lambda=init_lambda,
+                whiten_ks=whiten_ks,
+                noise_embedding=noise_embedding,
+                bias=bias,
+                relu_6=relu_6,
             )
         else:
             self.ema_model = RecurrentConvNLayer(
@@ -776,6 +840,18 @@ if __name__ == "__main__":
                         help="JFB reuse solution rate (default: 0)")
     parser.add_argument("--frequency_groups", type=int, default=None,
                         help="Frequency groups (default: None)")
+    parser.add_argument("--init_lambda", type=float, default=0.0,
+                        help="Initial lambda for the model (default: 0.0)")
+    parser.add_argument("--whiten_ks", type=int, default=3,
+                        help="Whiten kernel size (default: 3)")
+    parser.add_argument("--no_noise_embedding", action="store_true", default=False,
+                        help="No noise embedding (default: False)")
+    parser.add_argument("--loss_type", type=str, choices=["edm", "uniform"], default="edm",
+                        help="Loss type (default: edm)")
+    parser.add_argument("--no_bias", action="store_true", default=False,
+                        help="No bias (default: False)")
+    parser.add_argument("--relu_6", action="store_true", default=False,
+                        help="Use ReLU6 (default: False)")
     args = parser.parse_args()
     
     # Set up experiment directory with index to avoid collisions
@@ -868,6 +944,12 @@ if __name__ == "__main__":
         stable=args.stable,
         jfb_reuse_solution_rate=args.jfb_reuse_solution_rate,
         frequency_groups=args.frequency_groups,
+        init_lambda=args.init_lambda,
+        whiten_ks=args.whiten_ks,
+        noise_embedding=not args.no_noise_embedding,
+        loss_type=args.loss_type,
+        bias=not args.no_bias,
+        relu_6=args.relu_6,
     )
     
     # Load checkpoint if specified

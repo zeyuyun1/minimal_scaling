@@ -4,6 +4,8 @@ import torch.nn.functional as F
 import numpy as np
 import math
 import random
+from einops import rearrange
+from solver import broyden,naive_solver
 
 def sample_uniformly(n1, n2):
     return random.randint(int(n1), int(n2))
@@ -283,7 +285,7 @@ class RecurrentConvUnit_gram(nn.Module):
       - top_signal is a top-down feedback signal.
     """
     def __init__(self, in_channels, num_basis, kernel_size=7, stride=2,
-                 padding=3, eta=0.5, init_lambda=0.1, output_padding=1,learning_horizontal=True, groups=1):
+                 padding=3, eta=0.5, init_lambda=0.0, output_padding=1,learning_horizontal=True, groups=1, bias=True,relu_6=False):
         super(RecurrentConvUnit_gram, self).__init__()
         # Convolutional dictionary encoder.
         self.encoder = nn.Conv2d(
@@ -291,10 +293,11 @@ class RecurrentConvUnit_gram(nn.Module):
             kernel_size=kernel_size,
             stride=stride,
             padding=padding,
-            bias=True,
+            bias=bias,
             groups=groups,
         )
-        nn.init.constant_(self.encoder.bias, -init_lambda)
+        if bias:
+            nn.init.constant_(self.encoder.bias, -init_lambda)
         if learning_horizontal:
             # Horizontal / lateral connection: using a 1x1 grouped convolution.
             self.M = nn.Conv2d(
@@ -312,10 +315,14 @@ class RecurrentConvUnit_gram(nn.Module):
         # that the reconstructed (decoded) tensor matches the dimensions of a_prev.
         self.decoder = TiedTransposeConv(self.encoder, output_padding=output_padding)
         self.eta = eta
-        self.relu = nn.ReLU()
+        if relu_6:
+            # print("Using ReLU6")
+            self.relu = nn.ReLU6()
+        else:
+            self.relu = nn.ReLU()
         self.learning_horizontal = learning_horizontal
 
-    def forward(self, x, a_prev=None, top_signal=None, noise_emb=None):
+    def forward(self, x, a_prev=None, top_signal=None, noise_emb=None, T = 0):
         """
         Forward pass that updates the latent variable.
         
@@ -336,7 +343,7 @@ class RecurrentConvUnit_gram(nn.Module):
             # Otherwise, update the previous state.
             # update = self.encoder(x) + self.M(a_prev)
             update = self.encoder(x - self.decoder(a_prev)) - (self.M(a_prev) if self.learning_horizontal else 0)
-            a = self.relu(a_prev + self.eta * (update + feedback + noise_emb))
+            a = self.relu(a_prev + self.eta * (update + feedback + noise_emb) + np.sqrt(self.eta) * torch.randn_like(a_prev)*T)
         
         # Decode (reconstruct) from the latent representation.
         decoded = self.decoder(a)
@@ -1351,11 +1358,14 @@ class OneLayerAE_MinWithNoise(nn.Module):
         channel_mult_emb: int = 2,
         channel_mult_noise: int = 1,
         embedding_type: str = "positional",
-        init_lambda: float = 0.1,
+        init_lambda: float = 0.0,
+        noise_embedding: bool = True,
+        bias: bool = True,
     ):
         super().__init__()
         # --- Outer linear encoder/decoder (like whitening/unwhitening) ---
         # print(whiten_dim)
+        self.noise_embedding=noise_embedding
         if whiten_dim is not None:
             self.enc0 = Conv2d(in_channels=in_channels, out_channels=whiten_dim, kernel=3)
             self.dec0 = Conv2d(in_channels=whiten_dim, out_channels=in_channels, kernel=3)
@@ -1368,8 +1378,13 @@ class OneLayerAE_MinWithNoise(nn.Module):
         p1 = (k1 - 1) // 2
         c1 = num_basis[0]
         
-        self.E1  = nn.Conv2d(whiten_dim, c1, kernel_size=k1, stride=stride, padding=p1, bias=True)
-        nn.init.constant_(self.E1.bias, -init_lambda)
+        self.E1  = nn.Conv2d(whiten_dim, c1, kernel_size=k1, stride=stride, padding=p1, bias=bias)
+        # nn.init.constant_(self.E1.bias, -init_lambda)
+        # single_bias_term:
+        bias_term = nn.Parameter(torch.zeros(1,1,1,1))
+        nn.init.constant_(bias_term, -init_lambda)
+        self.register_parameter("bias_term", bias_term)
+
 
         # We'll compute output_padding dynamically in forward to match x0's H,W.
         self.D1  = nn.ConvTranspose2d(
@@ -1386,10 +1401,10 @@ class OneLayerAE_MinWithNoise(nn.Module):
         # --- Embedding maps (noise/label/augment -> emb_channels -> affine->c1) ---
         emb_channels   = num_basis[0] * channel_mult_emb
         noise_channels = num_basis[0] * channel_mult_noise
-
-        self.map_noise   = PositionalEmbedding(num_channels=noise_channels, endpoint=True)
-        self.map_layer0 = nn.Linear(noise_channels, emb_channels, bias=True)
-        self.affine     = nn.Linear(emb_channels, c1, bias=True)
+        if self.noise_embedding:
+            self.map_noise   = PositionalEmbedding(num_channels=noise_channels, endpoint=True)
+            self.map_layer0 = nn.Linear(noise_channels, emb_channels, bias=True)
+            self.affine     = nn.Linear(emb_channels, c1, bias=True)
 
 
     @torch.no_grad()
@@ -1441,15 +1456,18 @@ class OneLayerAE_MinWithNoise(nn.Module):
         if noise_labels is None:
             noise_labels = torch.zeros(B, device=x.device, dtype=x.dtype)
 
-        emb = self.map_noise(noise_labels)                       # [B, Cn]
-        emb = emb.reshape(B, 2, -1).flip(1).reshape(B, -1)       # swap sin/cos
-        emb = F.relu(self.map_layer0(emb))
-        noise_emb = self.affine(emb).unsqueeze(2).unsqueeze(3).to(x.dtype)  # [B, c1, 1, 1]
+        if self.noise_embedding:    
+            emb = self.map_noise(noise_labels)                       # [B, Cn]
+            emb = emb.reshape(B, 2, -1).flip(1).reshape(B, -1)       # swap sin/cos
+            emb = F.relu(self.map_layer0(emb))
+            noise_emb = self.affine(emb).unsqueeze(2).unsqueeze(3).to(x.dtype)  # [B, c1, 1, 1]
+        else:
+            noise_emb = 0
 
         # --- One-layer encode/decode with noise injected BEFORE ReLU ---
         x0 = self.enc0(x)
         preact = self.E1(x0)
-        h1 = self.act1(preact + noise_emb)
+        h1 = self.act1(preact + noise_emb + self.bias_term)
 
         # *** Key change: deconv to match x0's H,W with dynamic output_padding ***
         x0_hat = self._deconv_match(h1, target_hw=x0.shape[-2:])
@@ -1457,6 +1475,12 @@ class OneLayerAE_MinWithNoise(nn.Module):
         y = self.dec0(x0_hat)
 
         return y
+        
+    def infer(self, x, noise_labels=None,n_iter=1,return_feature=False,return_hist=False):
+        B = x.shape[0]
+        if noise_labels is None:
+            noise_labels = torch.zeros(B, device=x.device, dtype=x.dtype)
+        return self.forward(x, noise_labels=noise_labels)
 
 class RecurrentOneLayer(nn.Module):
     def __init__(self,in_channels,num_basis,kernel_size=7,
@@ -1483,7 +1507,8 @@ class RecurrentOneLayer(nn.Module):
             self.decoder = nn.Identity()
             prev_channels = in_channels
         self.levels = nn.ModuleList([
-            RecurrentConvUnit_gram(prev_channels,num_basis[0],kernel_size=kernel_size,eta=eta_base,stride=stride,output_padding=output_padding,learning_horizontal=learning_horizontal)
+            RecurrentConvUnit_gram(prev_channels,num_basis[0],kernel_size=kernel_size,eta=eta_base,
+            stride=stride,output_padding=output_padding,learning_horizontal=learning_horizontal)
         ])
         self.n_levels=1
 
@@ -1602,13 +1627,153 @@ class RecurrentOneLayer(nn.Module):
             return decoded_out
 
 
+# class RecurrentOneLayer_reuse(nn.Module):
+#     def __init__(self,in_channels,num_basis,kernel_size=7,
+#     stride=2,output_padding=1,whiten_dim=None,
+#     learning_horizontal=True,eta_base=0.1,
+#     jfb_no_grad_iters=None,jfb_with_grad_iters=None,
+#     jfb_reuse_solution_rate=0,jfb_ddp_safe=True,
+#     channel_mult_emb=2,channel_mult_noise=1,jfb_reuse_solution=0,mixer_value=0.0, frequency_groups=None, init_lambda=0.0, whiten_ks = 3):
+#         super().__init__()
+#         self.eta_base = eta_base
+#         # if frequency_groups is None:
+#         #     self.frequency_groups = in_channels
+#         # else:
+#         #     self.frequency_groups = frequency_groups
+#         # Default JFB tuples if None
+#         self.jfb_no_grad_iters = (0, 6) if jfb_no_grad_iters is None else tuple(jfb_no_grad_iters)
+#         self.jfb_with_grad_iters = (1, 3) if jfb_with_grad_iters is None else tuple(jfb_with_grad_iters)
+#         self.jfb_reuse_solution_rate = jfb_reuse_solution_rate
+#         self.jfb_ddp_safe = jfb_ddp_safe
+#         self._last_a = None
+#         self.mixer_value=mixer_value
+
+#         if whiten_dim is not None:
+#             self.encoder = Conv2d(in_channels, whiten_dim, kernel=whiten_ks)
+#             self.decoder = Conv2d(whiten_dim, in_channels, kernel=whiten_ks)
+#             prev_channels = whiten_dim
+#             if frequency_groups is not None:
+#                 G = prev_channels//frequency_groups
+#             else:
+#                 G = 1
+#         else:
+#             G =1
+#             self.encoder = nn.Identity()
+#             self.decoder = nn.Identity()
+#             prev_channels = in_channels
+#         self.levels = nn.ModuleList([
+#             RecurrentConvUnit_gram(prev_channels,num_basis[0],kernel_size=kernel_size,eta=eta_base,stride=stride,output_padding=output_padding,learning_horizontal=learning_horizontal, groups=G, init_lambda=init_lambda)
+#         ])
+#         self.n_levels=1
+
+#         # --- Embedding maps (noise/label/augment -> emb_channels -> affine->c1) ---
+#         emb_channels   = num_basis[0] * channel_mult_emb
+#         noise_channels = num_basis[0] * channel_mult_noise
+
+#         self.map_noise   = PositionalEmbedding(num_channels=noise_channels, endpoint=True)
+#         # I modified the following line.
+#         self.map_layer0 = nn.Linear(noise_channels, emb_channels, bias=True)
+#         self.affine     = nn.Linear(emb_channels, num_basis[0], bias=True)
+#         # init map_layer0 and affine both to 0
+#         nn.init.constant_(self.map_layer0.weight, 0)
+#         nn.init.constant_(self.affine.weight, 0)
+#         nn.init.constant_(self.map_layer0.bias, 0)
+#         nn.init.constant_(self.affine.bias, 0)
+    
+#     def forward(self, x, deq_mode=True,noise_labels=None):
+#         """If deq_mode=True: stochastic JFB; else: legacy unrolled."""
+#         B = x.shape[0]
+
+#         # --- Build embedding exactly in your order ---
+#         if noise_labels is None:
+#             noise_labels = torch.zeros(B, device=x.device, dtype=x.dtype)
+
+#         emb = self.map_noise(noise_labels)                       # [B, Cn]
+#         emb = emb.reshape(B, 2, -1).flip(1).reshape(B, -1)       # swap sin/cos
+#         emb = F.relu(self.map_layer0(emb))
+#         noise_emb = self.affine(emb).unsqueeze(2).unsqueeze(3).to(x.dtype)  # [B, c1, 1, 1]
+#         # noise_emb = emb.unsqueeze(2).unsqueeze(3).to(x.dtype)  # [B, c1, 1, 1]
+#         # noise_emb = 0
+#         x = self.encoder(x)
+
+#         # ----- JFB / DEQ mode -----
+#         a = [None] * self.n_levels
+#         decoded = [None] * self.n_levels
+
+#         # k ~ U{0..N}|dice>jfb_reuse_solution_rate
+#         k0 = sample_uniformly_with_long_tail(self.jfb_no_grad_iters[0], self.jfb_no_grad_iters[1],mixer_value =self.mixer_value) if self.jfb_reuse_solution_rate>random.random() else 0
+#         # n ~ U{0..N}
+#         n0 = sample_uniformly_with_long_tail(self.jfb_no_grad_iters[0], self.jfb_no_grad_iters[1],mixer_value=self.mixer_value)
+#         # m ~ U{1..M}
+#         m1 = random.randint(self.jfb_with_grad_iters[0], self.jfb_with_grad_iters[1])
+
+#         # ---- no-grad phase ----
+#         if n0 > 0:
+#             with torch.no_grad():
+#                 # either start with zero init, i.e. a, and decoded are zero, or start with random init, 
+#                 # i.e. a, and decoded are infered from random image with same noise level
+#                 # print(k0)
+#                 if k0>0:
+#                     perm_idx = torch.randperm(B)
+#                     for _ in range(k0):
+#                         self.forward_inter(x[perm_idx], a, decoded, noise_emb)
+#                 for _ in range(n0):
+#                     self.forward_inter(x, a, decoded, noise_emb)
+
+#         # cut graph between phases
+#         a = [ai.detach() if ai is not None else None for ai in a]
+
+#         # ---- with-grad phase ----
+#         for _ in range(m1):
+#             self.forward_inter(x, a, decoded, noise_emb)
+
+#         return self.decoder(decoded[0])
+
+#     def forward_inter(self, x, a, decoded, noise_emb=None):
+#         a[0], decoded[0] = self.levels[0](x, a_prev=a[0], top_signal=None, noise_emb=noise_emb)
+
+#     def infer(self, x, a = None, decoded = None, noise_labels=None,n_iter = 1,return_feature=False,return_hist =False):
+        
+#         B = x.shape[0]
+#         if a is None:
+#             a = [None] * self.n_levels
+#         if decoded is None:
+#             decoded = [None] * self.n_levels
+        
+#         decoded_hist = {"a":[],"decoded":[]}
+#         # --- Build embedding exactly in your order ---
+#         if noise_labels is None:
+#             noise_labels = torch.zeros(B, device=x.device, dtype=x.dtype)
+
+#         emb = self.map_noise(noise_labels)                       # [B, Cn]
+#         emb = emb.reshape(B, 2, -1).flip(1).reshape(B, -1)       # swap sin/cos
+#         emb = F.relu(self.map_layer0(emb))
+#         noise_emb = self.affine(emb).unsqueeze(2).unsqueeze(3).to(x.dtype)  # [B, c1, 1, 1]
+#         x = self.encoder(x)
+        
+#         with torch.no_grad():
+#             for _ in range(n_iter):
+#                 self.forward_inter(x, a, decoded, noise_emb)
+#                 decoded_hist["a"].append([i.cpu().detach() for i in a])
+#                 decoded_hist["decoded"].append([i.cpu().detach() for i in decoded])
+#         decoded_out = self.decoder(decoded[0])
+            
+#         if return_feature:
+#             if return_hist:
+#                 return a, decoded, decoded_hist
+#             else:
+#                 return a, decoded
+#         else:
+#             return decoded_out
+
 class RecurrentOneLayer_reuse(nn.Module):
     def __init__(self,in_channels,num_basis,kernel_size=7,
     stride=2,output_padding=1,whiten_dim=None,
     learning_horizontal=True,eta_base=0.1,
     jfb_no_grad_iters=None,jfb_with_grad_iters=None,
     jfb_reuse_solution_rate=0,jfb_ddp_safe=True,
-    channel_mult_emb=2,channel_mult_noise=1,jfb_reuse_solution=0,mixer_value=0.0, frequency_groups=None):
+    channel_mult_emb=2,channel_mult_noise=1,jfb_reuse_solution=0,mixer_value=0.0, 
+    frequency_groups=None,init_lambda=0.1,whiten_ks=3,noise_embedding=True,bias=True,relu_6=False):
         super().__init__()
         self.eta_base = eta_base
         # if frequency_groups is None:
@@ -1624,8 +1789,8 @@ class RecurrentOneLayer_reuse(nn.Module):
         self.mixer_value=mixer_value
 
         if whiten_dim is not None:
-            self.encoder = Conv2d(in_channels, whiten_dim, kernel=3)
-            self.decoder = Conv2d(whiten_dim, in_channels, kernel=3)
+            self.encoder = Conv2d(in_channels, whiten_dim, kernel=whiten_ks)
+            self.decoder = Conv2d(whiten_dim, in_channels, kernel=whiten_ks)
             prev_channels = whiten_dim
             if frequency_groups is not None:
                 G = prev_channels//frequency_groups
@@ -1635,18 +1800,23 @@ class RecurrentOneLayer_reuse(nn.Module):
             self.encoder = nn.Identity()
             self.decoder = nn.Identity()
             prev_channels = in_channels
+            G = 1
         self.levels = nn.ModuleList([
-            RecurrentConvUnit_gram(prev_channels,num_basis[0],kernel_size=kernel_size,eta=eta_base,stride=stride,output_padding=output_padding,learning_horizontal=learning_horizontal, groups=G)
+            RecurrentConvUnit_gram(prev_channels,num_basis[0],kernel_size=kernel_size,
+            eta=eta_base,stride=stride,output_padding=output_padding,learning_horizontal=learning_horizontal, groups=G, bias=bias,relu_6=relu_6)
         ])
         self.n_levels=1
+        self.noise_embedding = noise_embedding
+        if noise_embedding:
+            # --- Embedding maps (noise/label/augment -> emb_channels -> affine->c1) ---
+            emb_channels   = num_basis[0] * channel_mult_emb
+            noise_channels = num_basis[0] * channel_mult_noise
 
-        # --- Embedding maps (noise/label/augment -> emb_channels -> affine->c1) ---
-        emb_channels   = num_basis[0] * channel_mult_emb
-        noise_channels = num_basis[0] * channel_mult_noise
-
-        self.map_noise   = PositionalEmbedding(num_channels=noise_channels, endpoint=True)
-        self.map_layer0 = nn.Linear(noise_channels, emb_channels, bias=True)
-        self.affine     = nn.Linear(emb_channels, num_basis[0], bias=True)
+            self.map_noise   = PositionalEmbedding(num_channels=noise_channels, endpoint=True)
+            self.map_layer0 = nn.Linear(noise_channels, emb_channels, bias=True)
+            self.affine     = nn.Linear(emb_channels, num_basis[0], bias=True)
+        else:
+            self.lambda_bias = torch.nn.Parameter(torch.zeros(1,1,1,1))
     
     def forward(self, x, deq_mode=True,noise_labels=None):
         """If deq_mode=True: stochastic JFB; else: legacy unrolled."""
@@ -1656,11 +1826,15 @@ class RecurrentOneLayer_reuse(nn.Module):
         if noise_labels is None:
             noise_labels = torch.zeros(B, device=x.device, dtype=x.dtype)
 
-        emb = self.map_noise(noise_labels)                       # [B, Cn]
-        emb = emb.reshape(B, 2, -1).flip(1).reshape(B, -1)       # swap sin/cos
-        emb = F.relu(self.map_layer0(emb))
-        noise_emb = self.affine(emb).unsqueeze(2).unsqueeze(3).to(x.dtype)  # [B, c1, 1, 1]
-        # noise_emb = emb.unsqueeze(2).unsqueeze(3).to(x.dtype)  # [B, c1, 1, 1]
+        if self.noise_embedding:
+
+            emb = self.map_noise(noise_labels)                       # [B, Cn]
+            emb = emb.reshape(B, 2, -1).flip(1).reshape(B, -1)       # swap sin/cos
+            emb = F.relu(self.map_layer0(emb))
+            noise_emb = self.affine(emb).unsqueeze(2).unsqueeze(3).to(x.dtype)  # [B, c1, 1, 1]
+            # noise_emb = emb.unsqueeze(2).unsqueeze(3).to(x.dtype)  # [B, c1, 1, 1]
+        else:
+            noise_emb = self.lambda_bias
 
         x = self.encoder(x)
 
@@ -1684,9 +1858,9 @@ class RecurrentOneLayer_reuse(nn.Module):
                 if k0>0:
                     perm_idx = torch.randperm(B)
                     for _ in range(k0):
-                        self.forward_inter(x[perm_idx], a, decoded, noise_emb)
+                        self.forward_inter(x[perm_idx], a, decoded, noise_emb, T=0.1)
                 for _ in range(n0):
-                    self.forward_inter(x, a, decoded, noise_emb)
+                    self.forward_inter(x, a, decoded, noise_emb, T=0.1)
 
         # cut graph between phases
         a = [ai.detach() if ai is not None else None for ai in a]
@@ -1697,8 +1871,8 @@ class RecurrentOneLayer_reuse(nn.Module):
 
         return self.decoder(decoded[0])
 
-    def forward_inter(self, x, a, decoded, noise_emb=None):
-        a[0], decoded[0] = self.levels[0](x, a_prev=a[0], top_signal=None, noise_emb=noise_emb)
+    def forward_inter(self, x, a, decoded, noise_emb=None, T=0):
+        a[0], decoded[0] = self.levels[0](x, a_prev=a[0], top_signal=None, noise_emb=noise_emb, T=T)
 
     def infer(self, x, a = None, decoded = None, noise_labels=None,n_iter = 1,return_feature=False,return_hist =False):
         
@@ -1713,10 +1887,16 @@ class RecurrentOneLayer_reuse(nn.Module):
         if noise_labels is None:
             noise_labels = torch.zeros(B, device=x.device, dtype=x.dtype)
 
-        emb = self.map_noise(noise_labels)                       # [B, Cn]
-        emb = emb.reshape(B, 2, -1).flip(1).reshape(B, -1)       # swap sin/cos
-        emb = F.relu(self.map_layer0(emb))
-        noise_emb = self.affine(emb).unsqueeze(2).unsqueeze(3).to(x.dtype)  # [B, c1, 1, 1]
+        if self.noise_embedding:
+
+            emb = self.map_noise(noise_labels)                       # [B, Cn]
+            emb = emb.reshape(B, 2, -1).flip(1).reshape(B, -1)       # swap sin/cos
+            emb = F.relu(self.map_layer0(emb))
+            noise_emb = self.affine(emb).unsqueeze(2).unsqueeze(3).to(x.dtype)  # [B, c1, 1, 1]
+            # noise_emb = emb.unsqueeze(2).unsqueeze(3).to(x.dtype)  # [B, c1, 1, 1]
+        else:
+            noise_emb = self.lambda_bias
+            
         x = self.encoder(x)
         
         with torch.no_grad():
@@ -1876,6 +2056,156 @@ class RecurrentOneLayer_stable(nn.Module):
                 return a, decoded
         else:
             return decoded_out
+
+
+class RecurrentOneLayer_DEQ(nn.Module):
+    def __init__(self,in_channels,num_basis,kernel_size=7,
+    stride=2,output_padding=1,whiten_dim=None,
+    learning_horizontal=True,eta_base=0.1,jfb_with_grad_iters=None,
+    jfb_reuse_solution_rate=0,jfb_ddp_safe=True,
+    channel_mult_emb=2,channel_mult_noise=1,jfb_reuse_solution=0,mixer_value=0.0, 
+    frequency_groups=None,init_lambda=0.1,whiten_ks=3,noise_embedding=True,bias=True,relu_6=False):
+        super().__init__()
+        self.eta_base = eta_base
+        # if frequency_groups is None:
+        #     self.frequency_groups = in_channels
+        # else:
+        #     self.frequency_groups = frequency_groups
+        # Default JFB tuples if None
+        self.jfb_with_grad_iters = (1, 3) if jfb_with_grad_iters is None else tuple(jfb_with_grad_iters)
+        self.jfb_reuse_solution_rate = jfb_reuse_solution_rate
+        self.jfb_ddp_safe = jfb_ddp_safe
+        self._last_a = None
+        self.mixer_value=mixer_value
+
+        if whiten_dim is not None:
+            self.encoder = Conv2d(in_channels, whiten_dim, kernel=whiten_ks)
+            self.decoder = Conv2d(whiten_dim, in_channels, kernel=whiten_ks)
+            prev_channels = whiten_dim
+            if frequency_groups is not None:
+                G = prev_channels//frequency_groups
+            else:
+                G = 1
+        else:
+            self.encoder = nn.Identity()
+            self.decoder = nn.Identity()
+            prev_channels = in_channels
+            G = 1
+        self.levels = nn.ModuleList([
+            RecurrentConvUnit_gram(prev_channels,num_basis[0],kernel_size=kernel_size,
+            eta=eta_base,stride=stride,output_padding=output_padding,learning_horizontal=learning_horizontal, 
+            groups=G, bias=bias,relu_6=relu_6)
+        ])
+        self.n_levels=1
+        self.noise_embedding = noise_embedding
+        if noise_embedding:
+            # --- Embedding maps (noise/label/augment -> emb_channels -> affine->c1) ---
+            emb_channels   = num_basis[0] * channel_mult_emb
+            noise_channels = num_basis[0] * channel_mult_noise
+
+            self.map_noise   = PositionalEmbedding(num_channels=noise_channels, endpoint=True)
+            self.map_layer0 = nn.Linear(noise_channels, emb_channels, bias=True)
+            self.affine     = nn.Linear(emb_channels, num_basis[0], bias=True)
+        else:
+                self.lambda_bias = torch.nn.Parameter(torch.zeros(1,1,1,1))
+    # print()
+    def a_to_vec(self,a):             # a: [B, C, H, W] -> v: [B, C, H*W], plus shape token
+        B, C, H, W = a.shape
+        return a.flatten(1).unsqueeze(-1), (C, H, W)
+
+    def vec_to_a(self,v, shape):      # v: [B, C, L] -> a: [B, C, H, W]
+        C, H, W = shape
+        return rearrange(v.squeeze(-1),"b (c h w) -> b c h w",c = C, h = H)
+
+    def T_fix(self, x, a, noise_emb,shape):
+        a = self.vec_to_a(a,shape)
+        a_next, _decoded = self.levels[0](x, a_prev=a, top_signal=None, noise_emb=noise_emb)
+        a_next,_ = self.a_to_vec(a_next)
+        return a_next
+    
+    def forward(self, x, deq_mode=True,noise_labels=None):
+        """If deq_mode=True: stochastic JFB; else: legacy unrolled."""
+        B = x.shape[0]
+
+        # --- Build embedding exactly in your order ---
+        if noise_labels is None:
+            noise_labels = torch.zeros(B, device=x.device, dtype=x.dtype)
+
+        if self.noise_embedding:
+
+            emb = self.map_noise(noise_labels)                       # [B, Cn]
+            emb = emb.reshape(B, 2, -1).flip(1).reshape(B, -1)       # swap sin/cos
+            emb = F.relu(self.map_layer0(emb))
+            noise_emb = self.affine(emb).unsqueeze(2).unsqueeze(3).to(x.dtype)  # [B, c1, 1, 1]
+            # noise_emb = emb.unsqueeze(2).unsqueeze(3).to(x.dtype)  # [B, c1, 1, 1]
+        else:
+            noise_emb = self.lambda_bias
+
+        x = self.encoder(x)
+
+        with torch.no_grad():
+            a0, _ = self.levels[0](x, a_prev=None, top_signal=None, noise_emb=noise_emb)
+            a0_vec, shape = self.a_to_vec(a0)
+            result = naive_solver(lambda a: self.T_fix(x, a, noise_emb, shape),
+                                a0_vec, threshold=40,
+                                name="forward")
+            a_out = self.vec_to_a(result['result'],shape)
+            x_hat= self.levels[0].decoder(a_out)
+
+        # cut graph between phases
+        a = [a_out.detach()]
+        decoded = [x_hat.detach()]
+
+        m1 = random.randint(self.jfb_with_grad_iters[0], self.jfb_with_grad_iters[1])
+
+        # ---- with-grad phase ----
+        for _ in range(m1):
+            self.forward_inter(x, a, decoded, noise_emb)
+
+        return self.decoder(decoded[0])
+
+    def forward_inter(self, x, a, decoded, noise_emb=None):
+        a[0], decoded[0] = self.levels[0](x, a_prev=a[0], top_signal=None, noise_emb=noise_emb)
+
+    # def infer(self, x, a = None, decoded = None, noise_labels=None,n_iter = 1,return_feature=False,return_hist =False):
+        
+    #     B = x.shape[0]
+    #     if a is None:
+    #         a = [None] * self.n_levels
+    #     if decoded is None:
+    #         decoded = [None] * self.n_levels
+        
+    #     decoded_hist = {"a":[],"decoded":[]}
+    #     # --- Build embedding exactly in your order ---
+    #     if noise_labels is None:
+    #         noise_labels = torch.zeros(B, device=x.device, dtype=x.dtype)
+
+    #     if self.noise_embedding:
+
+    #         emb = self.map_noise(noise_labels)                       # [B, Cn]
+    #         emb = emb.reshape(B, 2, -1).flip(1).reshape(B, -1)       # swap sin/cos
+    #         emb = F.relu(self.map_layer0(emb))
+    #         noise_emb = self.affine(emb).unsqueeze(2).unsqueeze(3).to(x.dtype)  # [B, c1, 1, 1]
+    #         # noise_emb = emb.unsqueeze(2).unsqueeze(3).to(x.dtype)  # [B, c1, 1, 1]
+    #     else:
+    #         noise_emb = self.lambda_bias
+            
+    #     x = self.encoder(x)
+        
+    #     with torch.no_grad():
+    #         for _ in range(n_iter):
+    #             self.forward_inter(x, a, decoded, noise_emb)
+    #             decoded_hist["a"].append([i.cpu().detach() for i in a])
+    #             decoded_hist["decoded"].append([i.cpu().detach() for i in decoded])
+    #     decoded_out = self.decoder(decoded[0])
+            
+    #     if return_feature:
+    #         if return_hist:
+    #             return a, decoded, decoded_hist
+    #         else:
+    #             return a, decoded
+    #     else:
+    #         return decoded_out
 
 
 def UNetBlind64(**kwargs):
