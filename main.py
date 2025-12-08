@@ -15,9 +15,13 @@ from pytorch_lightning.loggers import WandbLogger
 from torchvision.datasets import ImageFolder
 from pytorch_lightning.utilities import rank_zero_only
 from torchvision.utils import make_grid
+# import sparselearning
+# from sparselearning.core import Masking, CosineDecay, LinearDecay
 
 from model import RecurrentConvNLayer,UNetBlind64,RecurrentConvNLayer2,RecurrentConvNLayer3
-from model import RecurrentConvNLayer_cc,OneLayerAE_MinWithNoise,RecurrentOneLayer,RecurrentOneLayer_stable,RecurrentOneLayer_reuse,RecurrentOneLayer_DEQ
+from model import RecurrentConvNLayer_cc,OneLayerAE_MinWithNoise,RecurrentOneLayer,RecurrentOneLayer_stable,RecurrentOneLayer_reuse,RecurrentOneLayer_DEQ,RecurrentOneLayer_splitNet
+from model import RecurrentOneLayer_diverse,RecurrentLayers_diverse,neural_sheet
+
 from torch.optim.lr_scheduler import LambdaLR
 import wandb
 import numpy as np
@@ -348,6 +352,19 @@ class LitDenoiser(pl.LightningModule):
         loss_type: str = "edm",
         bias: bool = True,
         relu_6: bool = False,
+        T: float = 0.1,
+        pyramid: bool = False,
+        groups: int = 2,
+        h_groups: int = 2,
+        energy_function: str = "elastic",
+        per_dim_threshold: bool = False,
+        positive_threshold: bool = False,
+        multiscale: bool = False,
+        num_basis_per_scale: list = None,
+        constraint_energy: str = "SC",
+        intra: bool = True,
+        k_inter: int = None,
+        n_hid_layers: int = -1,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -457,6 +474,67 @@ class LitDenoiser(pl.LightningModule):
                 noise_embedding=noise_embedding,
                 bias=bias,
                 relu_6=relu_6,
+                T=T,
+            )
+        elif model_arch == "SC_diverse":
+            self.model = RecurrentOneLayer_diverse(
+                in_channels=in_channels,
+                num_basis=num_basis,
+                eta_base=eta_base,
+                kernel_size=kernel_size,
+                stride=stride,
+                whiten_dim=whiten_dim,
+                jfb_no_grad_iters=jfb_no_grad_iters,
+                jfb_with_grad_iters=jfb_with_grad_iters,
+                jfb_reuse_solution=jfb_reuse_solution,
+                jfb_ddp_safe=jfb_ddp_safe,
+                learning_horizontal=learning_horizontal,
+                jfb_reuse_solution_rate=jfb_reuse_solution_rate,
+                frequency_groups=frequency_groups,
+                init_lambda=init_lambda,
+                whiten_ks=whiten_ks,
+                noise_embedding=noise_embedding,
+                bias=bias,
+                relu_6=relu_6,
+                T=T,
+                energy_function=energy_function,
+                pyramid=pyramid,
+                groups=groups,
+                h_groups=h_groups,
+                per_dim_threshold=per_dim_threshold,
+                positive_threshold=positive_threshold,
+                multiscale=multiscale,
+                num_basis_per_scale=num_basis_per_scale,
+            )
+        elif model_arch == "SC_NLayer_diverse":
+            self.model = RecurrentLayers_diverse(
+                in_channels=in_channels,
+                num_basis=num_basis,
+                eta_base=eta_base,
+                kernel_size=kernel_size,
+                stride=stride,
+                whiten_dim=whiten_dim,
+                jfb_no_grad_iters=jfb_no_grad_iters,
+                jfb_with_grad_iters=jfb_with_grad_iters,
+                jfb_reuse_solution=jfb_reuse_solution,
+                jfb_ddp_safe=jfb_ddp_safe,
+                learning_horizontal=learning_horizontal,
+                jfb_reuse_solution_rate=jfb_reuse_solution_rate,
+                frequency_groups=frequency_groups,
+                init_lambda=init_lambda,
+                whiten_ks=whiten_ks,
+                noise_embedding=noise_embedding,
+                bias=bias,
+                relu_6=relu_6,
+                T=T,
+                energy_function=energy_function,
+                pyramid=pyramid,
+                groups=groups,
+                h_groups=h_groups,
+                per_dim_threshold=per_dim_threshold,
+                positive_threshold=positive_threshold,
+                multiscale=multiscale,
+                num_basis_per_scale=num_basis_per_scale,
             )
         elif model_arch == "SC_DEQ":
             self.model = RecurrentOneLayer_DEQ(
@@ -478,6 +556,72 @@ class LitDenoiser(pl.LightningModule):
                 bias=bias,
                 relu_6=relu_6,
             )
+        elif model_arch == "SC_splitNet":
+            self.model = RecurrentOneLayer_splitNet(
+                in_channels=in_channels,
+                num_basis=num_basis,
+                eta_base=eta_base,
+                kernel_size=kernel_size,
+                stride=stride,
+                whiten_dim=whiten_dim,
+                jfb_no_grad_iters=jfb_no_grad_iters,
+                jfb_with_grad_iters=jfb_with_grad_iters,
+                jfb_reuse_solution=jfb_reuse_solution,
+                jfb_ddp_safe=jfb_ddp_safe,
+                learning_horizontal=learning_horizontal,
+                jfb_reuse_solution_rate=jfb_reuse_solution_rate,
+                frequency_groups=frequency_groups,
+                init_lambda=init_lambda,
+                whiten_ks=whiten_ks,
+                noise_embedding=noise_embedding,
+                bias=bias,
+                relu_6=relu_6,
+                T=T,
+                pyramid=pyramid,
+                groups=groups,
+                h_groups=h_groups,
+            )
+        elif model_arch == "neural_sheet":
+            self.model = neural_sheet(
+                in_channels=in_channels,
+                num_basis=num_basis,
+                eta_base=eta_base,
+                kernel_size=kernel_size,
+                stride=stride,
+                whiten_dim=whiten_dim,
+                jfb_no_grad_iters=jfb_no_grad_iters,
+                jfb_with_grad_iters=jfb_with_grad_iters,
+                jfb_reuse_solution=jfb_reuse_solution,
+                jfb_ddp_safe=jfb_ddp_safe,
+                learning_horizontal=learning_horizontal,
+                jfb_reuse_solution_rate=jfb_reuse_solution_rate,
+                init_lambda=init_lambda,
+                noise_embedding=noise_embedding,
+                bias=bias,
+                relu_6=relu_6,
+                T=T,
+                constraint_energy=constraint_energy,
+                groups=groups,
+                h_groups=h_groups,
+                per_dim_threshold=per_dim_threshold,
+                positive_threshold=positive_threshold,
+                multiscale=multiscale,
+                intra=intra,
+                k_inter=k_inter,
+                n_hid_layers=n_hid_layers,
+            )
+
+# class neural_sheet(nn.Module):
+#     def __init__(self,in_channels,num_basis,kernel_size=3,
+#     stride=2,output_padding=1,whiten_dim=None,
+#     learning_horizontal=True,eta_base=0.1,
+#     jfb_no_grad_iters=None,jfb_with_grad_iters=None,
+#     jfb_reuse_solution_rate=0,jfb_ddp_safe=True,
+#     channel_mult_emb=2,channel_mult_noise=1,jfb_reuse_solution=0,mixer_value=0.0, 
+#     init_lambda=0.1,noise_embedding=True,bias=True,
+#     relu_6=False,T=0.1,groups=1,h_groups=1,constraint_energy="SC",
+#     per_dim_threshold=True,positive_threshold=False,multiscale=False):
+        
         else:
             self.model = RecurrentConvNLayer(
                 in_channels=in_channels,
@@ -573,6 +717,7 @@ class LitDenoiser(pl.LightningModule):
                 noise_embedding=noise_embedding,
                 bias=bias,
                 relu_6=relu_6,
+                T=T,
             )
         elif model_arch == "SC_DEQ":
             self.ema_model = RecurrentOneLayer_DEQ(
@@ -594,6 +739,120 @@ class LitDenoiser(pl.LightningModule):
                 bias=bias,
                 relu_6=relu_6,
             )
+        elif model_arch == "SC_splitNet":
+            self.ema_model = RecurrentOneLayer_splitNet(
+                in_channels=in_channels,
+                num_basis=num_basis,
+                eta_base=eta_base,
+                kernel_size=kernel_size,
+                stride=stride,
+                whiten_dim=whiten_dim,
+                jfb_no_grad_iters=jfb_no_grad_iters,
+                jfb_with_grad_iters=jfb_with_grad_iters,
+                jfb_reuse_solution=jfb_reuse_solution,
+                jfb_ddp_safe=jfb_ddp_safe,
+                learning_horizontal=learning_horizontal,
+                jfb_reuse_solution_rate=jfb_reuse_solution_rate,
+                frequency_groups=frequency_groups,
+                init_lambda=init_lambda,
+                whiten_ks=whiten_ks,
+                noise_embedding=noise_embedding,
+                bias=bias,
+                relu_6=relu_6,
+                T=T,
+                pyramid=pyramid,
+                groups=groups,
+                h_groups=h_groups,
+            )
+        elif model_arch == "SC_diverse":
+            self.ema_model = RecurrentOneLayer_diverse(
+                in_channels=in_channels,
+                num_basis=num_basis,
+                eta_base=eta_base,
+                kernel_size=kernel_size,
+                stride=stride,
+                whiten_dim=whiten_dim,
+                jfb_no_grad_iters=jfb_no_grad_iters,
+                jfb_with_grad_iters=jfb_with_grad_iters,
+                jfb_reuse_solution=jfb_reuse_solution,
+                jfb_ddp_safe=jfb_ddp_safe,
+                learning_horizontal=learning_horizontal,
+                jfb_reuse_solution_rate=jfb_reuse_solution_rate,
+                frequency_groups=frequency_groups,
+                init_lambda=init_lambda,
+                whiten_ks=whiten_ks,
+                noise_embedding=noise_embedding,
+                bias=bias,
+                relu_6=relu_6,
+                T=T,
+                pyramid=pyramid,
+                groups=groups,
+                h_groups=h_groups,
+                energy_function=energy_function,
+                per_dim_threshold=per_dim_threshold,
+                positive_threshold=positive_threshold,
+                multiscale=multiscale,
+                num_basis_per_scale=num_basis_per_scale,
+            )
+        elif model_arch == "SC_NLayer_diverse":
+            self.ema_model = RecurrentLayers_diverse(
+                in_channels=in_channels,
+                num_basis=num_basis,
+                eta_base=eta_base,
+                kernel_size=kernel_size,
+                stride=stride,
+                whiten_dim=whiten_dim,
+                jfb_no_grad_iters=jfb_no_grad_iters,
+                jfb_with_grad_iters=jfb_with_grad_iters,
+                jfb_reuse_solution=jfb_reuse_solution,
+                jfb_ddp_safe=jfb_ddp_safe,
+                learning_horizontal=learning_horizontal,
+                jfb_reuse_solution_rate=jfb_reuse_solution_rate,
+                frequency_groups=frequency_groups,
+                init_lambda=init_lambda,
+                whiten_ks=whiten_ks,
+                noise_embedding=noise_embedding,
+                bias=bias,
+                relu_6=relu_6,
+                T=T,
+                energy_function=energy_function,
+                pyramid=pyramid,
+                groups=groups,
+                h_groups=h_groups,
+                per_dim_threshold=per_dim_threshold,
+                positive_threshold=positive_threshold,
+                multiscale=multiscale,
+                num_basis_per_scale=num_basis_per_scale,
+            )
+        elif model_arch == "neural_sheet":
+           self.ema_model = neural_sheet(
+                in_channels=in_channels,
+                num_basis=num_basis,
+                eta_base=eta_base,
+                kernel_size=kernel_size,
+                stride=stride,
+                whiten_dim=whiten_dim,
+                jfb_no_grad_iters=jfb_no_grad_iters,
+                jfb_with_grad_iters=jfb_with_grad_iters,
+                jfb_reuse_solution=jfb_reuse_solution,
+                jfb_ddp_safe=jfb_ddp_safe,
+                learning_horizontal=learning_horizontal,
+                jfb_reuse_solution_rate=jfb_reuse_solution_rate,
+                init_lambda=init_lambda,
+                noise_embedding=noise_embedding,
+                bias=bias,
+                relu_6=relu_6,
+                T=T,
+                constraint_energy=constraint_energy,
+                groups=groups,
+                h_groups=h_groups,
+                per_dim_threshold=per_dim_threshold,
+                positive_threshold=positive_threshold,
+                multiscale=multiscale,
+                intra=intra,
+                k_inter=k_inter,
+                n_hid_layers=n_hid_layers,
+            )
         else:
             self.ema_model = RecurrentConvNLayer(
                 in_channels=in_channels,
@@ -603,7 +862,7 @@ class LitDenoiser(pl.LightningModule):
                 kernel_size=kernel_size,
                 stride=stride,
                 n_iters_intra=n_iters_intra,
-            )
+            )        
         print("EMA",type(self.ema_model))
         # Copy initial parameters from main model to EMA model
         self.ema_model.load_state_dict(self.model.state_dict())
@@ -694,9 +953,12 @@ class LitDenoiser(pl.LightningModule):
                 if self.hparams.whiten_dim is not None:
                     w2 = root.dec0(w2).cpu()
             else:
-                w2 = root.levels[0].decoder.conv.weight.detach()
+                if self.hparams.multiscale and self.hparams.model_arch != "neural_sheet":
+                    w2 = root.levels[0].decoders[1].conv.weight.detach()
+                else:
+                    w2 = root.levels[0].decoder.conv.weight.detach()
                 if self.hparams.whiten_dim is not None:
-                    if self.hparams.frequency_groups is not None:
+                    if self.hparams.frequency_groups is not None or self.hparams.groups is not None:
                         pass
                     else:
                         w2 = root.decoder(w2).cpu()
@@ -731,6 +993,19 @@ class LitDenoiser(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer =  optim.Adam(self.parameters(), lr=self.hparams.lr)
+        # total_steps = self.trainer.estimated_stepping_batches
+        # decay = CosineDecay(args.prune_rate, T_max=total_steps)
+        # mask = Masking(optimizer, prune_rate_decay=decay,
+        #             prune_rate=args.prune_rate, growth_mode=args.growth,
+        #             prune_mode=args.prune, redistribution_mode=args.redistribution,
+        #             prune_every_k_steps=100)
+        # mask.add_module(
+        #     model,
+        #     density=0.05,                 # density ONLY for that tensor
+        #     sparse_init='constant',
+        #     debug_find=True,
+        #     keep_param_names=("M_inter.weight_v",)  # or the exact printed name prefix
+        # )
         scheduler = {
             'scheduler': LambdaLR(optimizer, lr_lambda=warmup_fn),
             'interval': 'step',
@@ -852,6 +1127,33 @@ if __name__ == "__main__":
                         help="No bias (default: False)")
     parser.add_argument("--relu_6", action="store_true", default=False,
                         help="Use ReLU6 (default: False)")
+    parser.add_argument("--T", type=float, default=0.0,
+                        help="Temperature for the model (default: 0.1)")
+    parser.add_argument("--pyramid", action="store_true", default=False,
+                        help="Use Gaussian pyramid (default: False)")
+    parser.add_argument("--groups", type=int, default=2,
+                        help="Groups (default: 2)")
+    parser.add_argument("--h_groups", type=int, default=2,
+                        help="Horizontal groups (default: 2)")
+    parser.add_argument("--energy_function", type=str, choices=["elastic", "BM","SC","hybrid"], default="elastic",
+                        help="Energy function (default: elastic)")
+    parser.add_argument("--per_dim_threshold", action="store_true", default=False,
+                        help="Per-dimension threshold (default: False)")
+    parser.add_argument("--positive_threshold", action="store_true", default=False,
+                        help="Positive threshold (default: False)")
+    parser.add_argument("--multiscale", action="store_true", default=False,
+                        help="Multiscale (default: False)")
+    parser.add_argument("--num_basis_per_scale", type=lambda s: [int(item) for item in s.split(',')], default=None,
+                        help="Comma-separated list for number of basis per scale, e.g. '64,64'.")
+    parser.add_argument("--constraint_energy", type=str, choices=["SC", "BM",], default="SC",
+                        help="Constraint energy (default: SC)")
+    parser.add_argument("--intra", action="store_true", default=False,
+                        help="Intra (default: True)")
+    parser.add_argument("--k_inter", type=int, default=None,
+                        help="k for inter layer weight norm (default: None)")
+    parser.add_argument("--n_hid_layers", type=int, default=-1,
+                        help="Number of hidden layers (default: -1)")
+    # sparselearning.core.add_sparse_args(parser)
     args = parser.parse_args()
     
     # Set up experiment directory with index to avoid collisions
@@ -950,6 +1252,19 @@ if __name__ == "__main__":
         loss_type=args.loss_type,
         bias=not args.no_bias,
         relu_6=args.relu_6,
+        T=args.T,
+        pyramid=args.pyramid,
+        groups=args.groups,
+        h_groups=args.h_groups,
+        energy_function=args.energy_function,
+        per_dim_threshold=args.per_dim_threshold,
+        positive_threshold=args.positive_threshold,
+        multiscale=args.multiscale,
+        num_basis_per_scale=args.num_basis_per_scale,
+        constraint_energy=args.constraint_energy,
+        intra=args.intra,
+        k_inter=args.k_inter,
+        n_hid_layers=args.n_hid_layers,
     )
     
     # Load checkpoint if specified
@@ -1087,6 +1402,7 @@ if __name__ == "__main__":
         accelerator=accelerator,
         devices=devices,
         strategy=strategy,
+        # strategy="ddp_find_unused_parameters_true",
         max_epochs=args.n_epochs,
         callbacks=[checkpoint_callback, ema_callback],
         logger=wandb_logger,

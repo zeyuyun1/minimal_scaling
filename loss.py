@@ -140,7 +140,7 @@ class EDMLossNoCond:
         self.noise_min, self.noise_max = noise_range
         self.edm_weighting = edm_weighting
 
-    def __call__(self, net, images: torch.Tensor):
+    def __call__(self, net, images: torch.Tensor,a=None,upstream_grad=None,return_feature=True):
         device = images.device
         B = images.shape[0]
 
@@ -154,13 +154,72 @@ class EDMLossNoCond:
 
         y = images
         n = torch.randn_like(y) * sigma
-        D_yn = net(y + n, noise_labels=sigma.flatten())  # EDM-preconditioned forward
+        # if return_feature:
+        #     feature = net(y + n, noise_labels=sigma.flatten(),a=a,upstream_grad=upstream_grad,return_feature=True)  # EDM-preconditioned forward
+        #     D_yn = feature["denoised"]
+        #     a = feature["a"]
+        #     upstream_grad = feature["upstream_grad"]
+        # else:
+            # a=upstream_grad=None
+        D_yn = net(y + n, noise_labels=sigma.flatten(),a=a,upstream_grad=upstream_grad)  # EDM-preconditioned forward
+
         if self.edm_weighting:
         # EDM weighting
             weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
             return weight * ((D_yn - y) ** 2)
         else:
             return (D_yn - y) ** 2
+
+
+class DSMLossNoCond:
+    """
+    Denoising Score Matching (DSM) loss with log-normal σ sampling.
+    Assumes `net(y_tilde, noise_labels=sigma.flatten())` returns
+    the score estimate ∂/∂y_tilde log p_σ(y_tilde) with the same shape as y_tilde.
+    """
+    def __init__(self, P_mean: float = -1.2, P_std: float = 1.2,
+                 sigma_data: float = 0.25, noise_range=(None, None),
+                 edm_weighting: bool = False):
+        self.P_mean = float(P_mean)
+        self.P_std = float(P_std)
+        self.sigma_data = float(sigma_data)
+        self.noise_min, self.noise_max = noise_range
+        self.edm_weighting = edm_weighting
+
+    def __call__(self, net, images: torch.Tensor):
+        device = images.device
+        B = images.shape[0]
+
+        # Sample σ ~ LogNormal(P_mean, P_std)
+        rnd = torch.randn(B, 1, 1, 1, device=device)
+        sigma = (rnd * self.P_std + self.P_mean).exp()  # [B,1,1,1]
+        if self.noise_min is not None:
+            sigma = sigma.clamp_min(self.noise_min)
+        if self.noise_max is not None:
+            sigma = sigma.clamp_max(self.noise_max)
+
+        y = images  # clean
+        n = torch.randn_like(y) * sigma  # Gaussian noise with std σ
+        y_tilde = y + n                  # noisy input
+
+        # Model score estimate s_θ(y_tilde, σ)
+        # net should return a tensor with same shape as y_tilde
+        scores = net(y_tilde, noise_labels=sigma.flatten())
+
+        # DSM target: - (1/σ^2) * (y_tilde - y) = - n / σ^2 = -ε/σ
+        target = - n / (sigma ** 2)      # broadcasts over C,H,W
+
+        # Per-pixel squared error between score and target
+        loss = (scores - target) ** 2
+
+        if self.edm_weighting:
+            # Optional EDM-style weighting (same as your EDMLossNoCond)
+            weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
+            loss = weight * loss  # broadcasts over channels/spatial
+
+        # Return per-pixel loss; caller can do .mean() or .sum()
+        return loss
+
 
 
 # class SimpleUniformNoiseLoss:
