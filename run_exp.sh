@@ -1196,6 +1196,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 python main.py --gpus 3 --project_name scaling-new-fa
 
 
 
+
 CUDA_VISIBLE_DEVICES=4,5,6,7 python main.py --gpus 4 --project_name scaling-mnist-exercise --batch_size 128 --n_epochs 2000 \
 --lr 3e-4 --exp_name layer1-multiscale_SC --model_arch neural_sheet --in_channels 1 \
 --num_basis 32,32 --sigma 0.01,1 --img_size 28 --kernel_size 7 --jfb_no_grad_iters 1,5 \
@@ -1218,3 +1219,16 @@ CUDA_VISIBLE_DEVICES=0,1,2 python main.py --gpus 3 --project_name scaling-new-fa
 --checkpoint_path pretrained_model/scaling-new-face/00106_layer1_neural_sheet_intra_reuse/denoiser.ckpt --load_all_weights
 
 
+
+
+ CUDA_VISIBLE_DEVICES=0,1,2 python main.py --gpus 3 --project_name scaling-new-face --batch_size 64 \
+ --n_epochs 500 --lr 3e-4 --exp_name layer1_neural_sheet_intra_no_eta_emb --model_arch neural_sheet \
+ --in_channels 3 --num_basis 32,64,64 --sigma 0.01,2 --img_size 64 --kernel_size 7 --jfb_no_grad_iters 1,5 \
+ --jfb_with_grad_iters 1,3 --eta_base 0.1 --edm_weighting --jfb_reuse_solution_rate 0. --groups 1 --h_groups 1 \
+ --per_dim_threshold --constraint_energy SC --multiscale --intra 
+
+
+
+  CUDA_VISIBLE_DEVICES=0,1,2 python main.py --gpus 3 --project_name scaling-mnist-exercise --batch_size 128 --n_epochs 2000 --lr 3e-4 --exp_name simple-net \
+ --model_arch SC_simple --in_channels 1 --num_basis 32,32 --sigma 0.01,1 --img_size 28 --kernel_size 7 \
+ --eta_base 0.2 --edm_weighting --dataset mnist \ 

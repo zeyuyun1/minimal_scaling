@@ -20,7 +20,7 @@ from torchvision.utils import make_grid
 
 from model import RecurrentConvNLayer,UNetBlind64,RecurrentConvNLayer2,RecurrentConvNLayer3
 from model import RecurrentConvNLayer_cc,OneLayerAE_MinWithNoise,RecurrentOneLayer,RecurrentOneLayer_stable,RecurrentOneLayer_reuse,RecurrentOneLayer_DEQ,RecurrentOneLayer_splitNet
-from model import RecurrentOneLayer_diverse,RecurrentLayers_diverse,neural_sheet
+from model import RecurrentOneLayer_diverse,RecurrentLayers_diverse,neural_sheet,RecurrentConvNLayer_simple
 
 from torch.optim.lr_scheduler import LambdaLR
 import wandb
@@ -365,6 +365,10 @@ class LitDenoiser(pl.LightningModule):
         intra: bool = True,
         k_inter: int = None,
         n_hid_layers: int = -1,
+        eta_emb: bool = False,
+        tied_transpose: bool = True,
+        num_classes: int = 0,
+        cond_drop_prob: float = 0.0,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -581,6 +585,16 @@ class LitDenoiser(pl.LightningModule):
                 groups=groups,
                 h_groups=h_groups,
             )
+        elif model_arch == "SC_simple":
+            self.model = RecurrentConvNLayer_simple(
+                in_channels=in_channels,
+                num_basis=num_basis,
+                eta_base=eta_base,
+                kernel_size=kernel_size,
+                stride=stride,
+                num_classes=num_classes,
+                cond_drop_prob=cond_drop_prob,
+            )
         elif model_arch == "neural_sheet":
             self.model = neural_sheet(
                 in_channels=in_channels,
@@ -609,6 +623,8 @@ class LitDenoiser(pl.LightningModule):
                 intra=intra,
                 k_inter=k_inter,
                 n_hid_layers=n_hid_layers,
+                eta_emb=eta_emb,
+                tied_transpose=tied_transpose,
             )
 
 # class neural_sheet(nn.Module):
@@ -824,6 +840,16 @@ class LitDenoiser(pl.LightningModule):
                 multiscale=multiscale,
                 num_basis_per_scale=num_basis_per_scale,
             )
+        elif model_arch == "SC_simple":
+            self.ema_model = RecurrentConvNLayer_simple(
+                in_channels=in_channels,
+                num_basis=num_basis,
+                eta_base=eta_base,
+                kernel_size=kernel_size,
+                stride=stride,
+                num_classes=num_classes,
+                cond_drop_prob=cond_drop_prob,
+            )
         elif model_arch == "neural_sheet":
            self.ema_model = neural_sheet(
                 in_channels=in_channels,
@@ -852,6 +878,7 @@ class LitDenoiser(pl.LightningModule):
                 intra=intra,
                 k_inter=k_inter,
                 n_hid_layers=n_hid_layers,
+                eta_emb=eta_emb,
             )
         else:
             self.ema_model = RecurrentConvNLayer(
@@ -874,8 +901,8 @@ class LitDenoiser(pl.LightningModule):
         return self.model(x, noise_labels)
 
     def training_step(self, batch, batch_idx):
-        x, _ = batch
-        per_pix = self.loss_obj(self.model, x)
+        x, labels = batch
+        per_pix = self.loss_obj(self.model, x, class_labels=labels)
         loss = per_pix.mean()
         self.log("train_loss", loss, on_step=False, on_epoch=True, sync_dist=True)        
         return loss
@@ -1153,6 +1180,18 @@ if __name__ == "__main__":
                         help="k for inter layer weight norm (default: None)")
     parser.add_argument("--n_hid_layers", type=int, default=-1,
                         help="Number of hidden layers (default: -1)")
+    parser.add_argument("--eta_emb", action="store_true", default=False,
+                        help="Use eta embedding (default: False)")
+    parser.add_argument("--num_classes", type=int, default=0,
+                        help="Number of classes (default: 0)")
+    parser.add_argument("--cond_drop_prob", type=float, default=0.0,
+                        help="Conditional dropout probability (default: 0.0)")
+    parser.add_argument(
+        "--no_tied_transpose",
+        action="store_false",
+        default=True,
+        help="Disable tied transpose (default: enabled)"
+    )
     # sparselearning.core.add_sparse_args(parser)
     args = parser.parse_args()
     
@@ -1265,6 +1304,10 @@ if __name__ == "__main__":
         intra=args.intra,
         k_inter=args.k_inter,
         n_hid_layers=args.n_hid_layers,
+        eta_emb=args.eta_emb,
+        tied_transpose=not args.no_tied_transpose,
+        num_classes=args.num_classes,
+        cond_drop_prob=args.cond_drop_prob,
     )
     
     # Load checkpoint if specified

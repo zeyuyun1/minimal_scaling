@@ -140,7 +140,7 @@ class EDMLossNoCond:
         self.noise_min, self.noise_max = noise_range
         self.edm_weighting = edm_weighting
 
-    def __call__(self, net, images: torch.Tensor,a=None,upstream_grad=None,return_feature=True):
+    def __call__(self, net, images: torch.Tensor,a=None,upstream_grad=None,return_feature=True,class_labels=None):
         device = images.device
         B = images.shape[0]
 
@@ -161,7 +161,10 @@ class EDMLossNoCond:
         #     upstream_grad = feature["upstream_grad"]
         # else:
             # a=upstream_grad=None
-        D_yn = net(y + n, noise_labels=sigma.flatten(),a=a,upstream_grad=upstream_grad)  # EDM-preconditioned forward
+        if class_labels is not None:
+            D_yn = net(y + n, noise_labels=sigma.flatten(),class_labels=class_labels)  # EDM-preconditioned forward
+        else:
+            D_yn = net(y + n, noise_labels=sigma.flatten())  # EDM-preconditioned forward
 
         if self.edm_weighting:
         # EDM weighting

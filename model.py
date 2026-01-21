@@ -307,7 +307,7 @@ class RecurrentConvUnit(nn.Module):
         self.eta = eta
         self.relu = nn.ReLU()
 
-    def forward(self, x, a_prev=None, top_signal=None):
+    def forward(self, x, a_prev=None, top_signal=None, noise_emb=None):
         """
         Forward pass that updates the latent variable.
         
@@ -318,14 +318,15 @@ class RecurrentConvUnit(nn.Module):
         """
         # Use zero feedback if none provided.
         feedback = top_signal if top_signal is not None else 0
+        noise_emb = noise_emb if noise_emb is not None else 0
         
         if a_prev is None:
             # Initial iteration: use only feedforward drive.
-            a = self.relu(self.eta * (self.encoder(x) + feedback))
+            a = self.relu(self.eta * (self.encoder(x) + feedback + noise_emb))
         else:
             # Otherwise, update the previous state.
             update = self.encoder(x) + self.M(a_prev)
-            a = self.relu(a_prev + self.eta * (update + feedback))
+            a = self.relu(a_prev + self.eta * (update + feedback + noise_emb))
         
         # Decode (reconstruct) from the latent representation.
         decoded = self.decoder(a)
@@ -3366,7 +3367,169 @@ class RecurrentOneLayer_DEQ(nn.Module):
     #     else:
     #         return decoded_out
 
+class RecurrentConvNLayer_simple(nn.Module):
+    def __init__(self, in_channels, num_basis,
+                 n_iters_inter=1, n_iters_intra=4,eta_base=0.1,
+                 kernel_size=3, stride=2, output_padding=1, learning_horizontal = True,
+                 eta_ls = None,channel_mult_emb=2,channel_mult_noise=1, 
+                 num_classes: int = 0, cond_drop_prob: float = 0.0):
+        super().__init__()
+        self.n_levels = len(num_basis)
+        self.n_iters_inter = n_iters_inter           # keep as 1 for DEQ
+        self.n_iters_intra = n_iters_intra
+        self.eta_base = eta_base
 
+        # noise_embeddings
+        emb_channels   = num_basis[0] * channel_mult_emb
+        noise_embed_dim = noise_channels = num_basis[0] * channel_mult_noise
+        self.map_noise   = PositionalEmbedding(num_channels=noise_channels, endpoint=True)
+        self.map_layer0 = nn.Linear(noise_channels, emb_channels, bias=True)
+        # self.affine = nn.Linear(emb_channels, num_basis[0], bias=True)
+        self.affines = nn.ModuleList([nn.Linear(emb_channels, nb, bias=True) for nb in num_basis])
+        # zero_init(self.map_layer0)
+
+            # ---- Label conditioning ----
+        self.num_classes = int(num_classes) if num_classes is not None else 0
+        self.noise_embed_dim = int(noise_embed_dim)
+        self.cond_drop_prob = float(cond_drop_prob)
+
+        if self.num_classes > 0:
+            # +1 for a learned "null/unconditional" label embedding (for classifier-free guidance)
+            self.null_class = self.num_classes
+            self.label_embed = nn.Embedding(self.num_classes + 1, self.noise_embed_dim)
+        else:
+            self.null_class = None
+            self.label_embed = None
+        
+        # Default eta list if not provided; validate length
+        if eta_ls is None:
+            self.eta_ls = [float(eta_base)] * self.n_levels
+        else:
+            if len(eta_ls) != self.n_levels:
+                raise ValueError(f"eta_ls length {len(eta_ls)} must match number of levels {self.n_levels}")
+            self.eta_ls = [float(x) for x in eta_ls]
+
+        prev_channels = in_channels
+        levels = []
+        for i, nb in enumerate(num_basis):
+            levels.append(
+                RecurrentConvUnit(
+                    in_channels=prev_channels,
+                    num_basis=nb,
+                    kernel_size=kernel_size if i > 0 else 7,
+                    stride=stride,
+                    padding=kernel_size // 2 if i > 0 else 3,
+                    eta=self.eta_ls[i],
+                    output_padding=output_padding,
+                )
+            )
+            prev_channels = nb
+        self.levels = nn.ModuleList(levels)
+        
+        
+    def _get_label_embedding(self, class_labels, B: int, device, dtype):
+        """
+        Returns label embedding vector of shape [B, noise_embed_dim] in `dtype`.
+        Supports:
+          - class_labels is None  -> unconditional
+          - class_labels shape [B] (int class indices)
+          - class_labels shape [B, num_classes] (one-hot or soft)
+        """
+        if self.label_embed is None:
+            return torch.zeros(B, self.noise_embed_dim, device=device, dtype=dtype)
+
+        # Unconditional path
+        if class_labels is None:
+            idx = torch.full((B,), self.null_class, device=device, dtype=torch.long)
+            return self.label_embed(idx).to(dtype)
+
+        # Integer labels: [B]
+        idx = class_labels.to(device=device, dtype=torch.long)
+
+        # Classifier-free guidance dropout during training:
+        # randomly replace some labels with the null label.
+        if self.training and self.cond_drop_prob > 0.0:
+            drop = (torch.rand(B, device=device) < self.cond_drop_prob)
+            if drop.any():
+                idx = idx.clone()
+                idx[drop] = self.null_class
+
+        return self.label_embed(idx).to(dtype)
+
+    def get_embedding(self, x, noise_labels =None, class_labels=None):
+        B,_,_,_ = x.shape
+
+        if noise_labels is None:
+            noise_labels = torch.zeros(B, device=x.device, dtype=x.dtype)
+
+        emb = self.map_noise(noise_labels)                       # [B, Cn]
+        emb = emb.reshape(B, 2, -1).flip(1).reshape(B, -1)       # swap sin/cos
+
+
+        # ---- label embedding vector (same dim as emb) ----
+        y_emb = self._get_label_embedding(
+            class_labels=class_labels,
+            B=B,
+            device=x.device,
+            dtype=emb.dtype,   # keep it compatible with emb before map_layer0
+        )                                                         # [B, Cn]
+
+        # Fuse conditioning (typical pattern: additive)
+        emb = emb + y_emb
+
+        noise_emb = F.relu(self.map_layer0(emb))
+        # noise_emb = self.affine(noise_emb).unsqueeze(2).unsqueeze(3).to(x.dtype)  # [B, c1, 1, 1]
+        noise_emb = [affine(noise_emb).unsqueeze(2).unsqueeze(3).to(x.dtype) for affine in self.affines]
+        return noise_emb
+
+
+    def forward(self, x, deq_mode=True, noise_labels = None, class_labels=None,return_feature=False,CFG_scale=0.0):
+        B,_,_,_ = x.shape
+        # initalize state and label embddings
+        a = [None] * self.n_levels
+        decoded = [None] * self.n_levels
+        noise_emb = self.get_embedding(x, noise_labels, class_labels)
+
+        if CFG_scale > 0.0:
+            a_uncond = [None] * self.n_levels
+            decoded_uncond = [None] * self.n_levels
+            noise_emb_uncond = self.get_embedding(x, noise_labels, torch.full((B,), self.null_class, device=x.device, dtype=torch.long))
+
+        # ---- with-grad phase ----
+        for _ in range(self.n_iters_intra):
+            self.forward_inter(x, a, decoded, noise_emb)
+            if CFG_scale > 0.0:
+                self.forward_inter(x, a_uncond, decoded_uncond, noise_emb_uncond)
+                for i in range(self.n_levels):
+                    a[i] = a[i] + CFG_scale * (a[i] - a_uncond[i])
+                    decoded[i] = decoded[i] + CFG_scale * (decoded[i] - decoded_uncond[i])
+
+        if return_feature:
+            return a, decoded
+        else:
+            return decoded[0]
+
+    def forward_inter(self, x, a, decoded, noise_emb=None):
+        if noise_emb is None:
+            noise_emb = [None] * self.n_levels
+
+        # bottom-up
+        for i in range(len(self.levels)):
+            inp = x if i == 0 else a[i - 1]
+            top_signal = decoded[i + 1] if i < self.n_levels - 1 else None
+            a_cur = a[i]
+            for _ in range(self.n_iters_inter):
+                a_cur, decoded_cur = self.levels[i](inp, a_prev=a_cur, top_signal=top_signal, noise_emb= noise_emb[i])
+            a[i], decoded[i] = a_cur, decoded_cur
+
+        # top-down
+        for i in range(self.n_levels - 1, -1, -1):
+            inp = x if i == 0 else a[i - 1]
+            top_signal = decoded[i + 1] if i < self.n_levels - 1 else None
+            a_cur = a[i]
+            for _ in range(self.n_iters_inter):
+                a_cur, decoded_cur = self.levels[i](inp, a_prev=a_cur, top_signal=top_signal, noise_emb= noise_emb[i])
+            a[i], decoded[i] = a_cur, decoded_cur
 
 class neural_node(nn.Module):
     """
@@ -3393,7 +3556,7 @@ class neural_node(nn.Module):
     def __init__(self, in_channels, num_basis_prev, num_basis, kernel_size=7, stride=2,
                  padding=3, eta=0.5, init_lambda=0.0, output_padding=1,
                  learning_horizontal=True, groups=1, bias=False, relu_6=True, 
-                 wnorm=True, h_groups =1, constraint_energy="SC", k_inter = None, down=True):
+                 wnorm=True, h_groups =1, constraint_energy="SC", k_inter = None, down=True,tied_transpose=True):
         super(neural_node, self).__init__()
         # Convolutional dictionary encoder.
         
@@ -3418,10 +3581,22 @@ class neural_node(nn.Module):
                 bias=False,
                 groups=groups,
             )
-            self.M_intra_T = TiedTransposeConv(self.M_intra, output_padding=output_padding)
+            if tied_transpose:
+                self.M_intra_T = TiedTransposeConv(self.M_intra, output_padding=output_padding)
+            else:
+                self.M_intra_T = nn.ConvTranspose2d(
+                    num_basis, num_basis_prev,
+                    stride = M_stride,
+                    kernel_size=3,
+                    padding =1,
+                    bias=False,
+                    groups=groups,
+                    output_padding = output_padding,
+                )
         else:
             self.M_intra = self.M_intra_T = None
             
+        self.tied_transpose = tied_transpose
 
         if in_channels:
             self.encoder = nn.Conv2d(
@@ -3438,7 +3613,10 @@ class neural_node(nn.Module):
         # Tied transpose convolution for decoding. The added output_padding ensures
         # that the reconstructed (decoded) tensor matches the dimensions of a_prev.
         # self.decoder = TiedTransposeConv(self.encoder, output_padding=output_padding)
-        self.eta = eta
+        self.eta = torch.tensor(eta)
+        # register eta as a buffer ? 
+        # self.register_buffer('eta', self.eta)
+
         if relu_6:
             # print("Using ReLU6")
             self.relu = nn.ReLU6()
@@ -3457,6 +3635,8 @@ class neural_node(nn.Module):
                 self.encoder, self._enc_wn = weight_norm(self.encoder, names=['weight'], dim=0)
             if self.M_intra is not None:
                 self.M_intra, self._M_intra_wn = weight_norm(self.M_intra, names=['weight'], dim=0)
+            if self.M_intra_T is not None and not self.tied_transpose:
+                self.M_intra_T, self._M_intra_T_wn = weight_norm(self.M_intra_T, names=['weight'], dim=0)
 
     def reset_wnorm(self):
         """Recompute normalized weights once per batch/forward."""
@@ -3468,6 +3648,8 @@ class neural_node(nn.Module):
             self._M_inter_wn.reset(self.M_inter)
         if self.M_intra is not None:
             self._M_intra_wn.reset(self.M_intra)
+        if self.M_intra_T is not None and not self.tied_transpose:
+            self._M_intra_T_wn.reset(self.M_intra_T)
 
     def decompose_M_inter(self,n_components=1,steer_components=None):
         horizontal = self.M_inter.weight.data
@@ -3483,7 +3665,8 @@ class neural_node(nn.Module):
         self.M_inter.weight.data = V_back
                 # self.M_inter
 
-    def forward(self, a_p_1=None, a_prev=None, x_c = None, top_signal=None, noise_emb=None, T = 0,n_components=None, steer_components=None):
+    def forward(self, a_p_1=None, a_prev=None, x_c = None, 
+    top_signal=None, noise_emb=None, T = 0,n_components=None, steer_components=None, eta_emb=None):
         """
         a_i 
         basis energy associated with this term: 
@@ -3505,6 +3688,10 @@ class neural_node(nn.Module):
           a_prev: Previous latent variable (if None, initialize from feedforward drive).
           top_signal: Top-down feedback signal (must match the shape of the latent code).
         """
+        if eta_emb is not None:
+            eta = eta_emb
+        else:
+            eta = self.eta
         self.reset_wnorm()
         if n_components is not None:
             self.decompose_M_inter(n_components,steer_components)
@@ -3519,20 +3706,20 @@ class neural_node(nn.Module):
         if a_prev is None:
             # print(constraint_ff.shape if constraint_ff is not 0 else None , feedup.shape if feedup is not 0 else None)
             if x_c is not None:
-                a = self.relu(self.eta * (constraint_ff + noise_emb))
+                a = self.relu(eta * (constraint_ff + noise_emb))
             else:
-                a = self.relu(self.eta * (constraint_ff - feedup - feedback + noise_emb))   
+                a = self.relu(eta * (constraint_ff - feedup - feedback + noise_emb))   
         else:
             # basis update             
             update = - feedup - a_inter - feedback + noise_emb            
-            a = a_prev + self.eta * update + np.sqrt(self.eta) * torch.randn_like(a_prev)*T
+            a = a_prev + eta * update + torch.sqrt(eta) * torch.randn_like(a_prev)*T
             if self.encoder is not None:
                 # TODO: still need to implement partial injection
                 if self.constraint_energy == "SC":
                     ff = self.encoder(x_c - self.decoder(a_prev))
                 else:
                     ff = self.encoder(x_c)
-                a = a + self.eta * ff
+                a = a + eta * ff
             a = self.relu(a)
         # Decode (reconstruct) from the latent representation.
         # print(self.M_intra_T,a.shape)
@@ -3552,7 +3739,8 @@ class neural_sheet(nn.Module):
     channel_mult_emb=2,channel_mult_noise=1,jfb_reuse_solution=0,mixer_value=0.0, 
     init_lambda=0.1,noise_embedding=True,bias=True,
     relu_6=False,T=0.1,groups=1,h_groups=1,constraint_energy="SC",
-    per_dim_threshold=True,positive_threshold=False,multiscale=False,intra=True,k_inter=None,n_hid_layers=-1):
+    per_dim_threshold=True,positive_threshold=False,multiscale=False,intra=True,
+    k_inter=None,n_hid_layers=-1,eta_emb=False,tied_transpose=True):
         super().__init__()
         # network topology: chain, ring, sheet?
 
@@ -3594,7 +3782,7 @@ class neural_sheet(nn.Module):
                 neural_node(in_channels, prev_channels, nb, kernel_size=kernel_size,
                 eta=eta_base,stride=stride,padding = kernel_size // 2 if i > 0 else 3, output_padding=output_padding,
                 learning_horizontal=learning_horizontal, groups=groups, bias=bias,relu_6=relu_6, 
-                h_groups=h_groups, constraint_energy = constraint_energy, k_inter = k_inter)
+                h_groups=h_groups, constraint_energy = constraint_energy, k_inter = k_inter, tied_transpose=tied_transpose)
             )
             self.injection_dic[counter] = i
             counter+=1
@@ -3605,7 +3793,7 @@ class neural_sheet(nn.Module):
                         neural_node(None, nb, nb, kernel_size=kernel_size,
                         eta=eta_base,stride=stride,padding = kernel_size // 2 if i > 0 else 3, output_padding=output_padding,
                         learning_horizontal=learning_horizontal, groups=groups, bias=bias,relu_6=relu_6, 
-                        h_groups=h_groups, constraint_energy = constraint_energy, k_inter = k_inter, down=False)
+                        h_groups=h_groups, constraint_energy = constraint_energy, k_inter = k_inter, down=False, tied_transpose=tied_transpose)
                     )
                     counter+=1
             if intra:
@@ -3621,8 +3809,13 @@ class neural_sheet(nn.Module):
 
             self.map_noise   = PositionalEmbedding(num_channels=noise_channels, endpoint=True)
             self.map_layer0 = nn.Linear(noise_channels, emb_channels, bias=True)
+            self.eta_affine = nn.Linear(emb_channels, 1, bias=True) if eta_emb else None
             # self.affines     = nn.ModuleList([nn.Linear(emb_channels, d if per_dim_threshold else 1, bias=True) for d in num_basis])
             self.affines =  nn.ModuleList([nn.Linear(emb_channels, node.num_basis if per_dim_threshold else 1, bias=True) for node in self.levels])
+            for lin in self.affines:
+                nn.init.zeros_(lin.weight)
+                if lin.bias is not None:
+                    nn.init.zeros_(lin.bias)
         else:
             self.lambda_bias = nn.ModuleList([torch.nn.Parameter(torch.zeros(1,1,1,1)) for _ in num_basis])
             
@@ -3640,7 +3833,9 @@ class neural_sheet(nn.Module):
                 lvl.decompose_M_inter(n_components=n_components,steer_components=steer_components)
     
 
-    def forward(self, x, a=None, upstream_grad=None, noise_labels=None, T=None,return_feature=False,infer_mode=False,n_iters=None,n_components =None,steer_components=None):
+    def forward(self, x, a=None, upstream_grad=None, noise_labels=None,
+     T=None,return_feature=False,infer_mode=False,n_iters=None,
+     n_components =None,steer_components=None, neuron_steer = None,return_history=False):
         """If deq_mode=True: stochastic JFB; else: legacy unrolled."""
         B = x.shape[0]
         if T is None:
@@ -3664,6 +3859,21 @@ class neural_sheet(nn.Module):
                 noise_emb_ls = [F.relu(emb) for emb in noise_emb_ls]
                 # print(len(noise_emb))
             # noise_emb = emb.unsqueeze(2).unsqueeze(3).to(x.dtype)  # [B, c1, 1, 1]
+            if self.eta_affine is not None:
+                eta_emb = F.relu(self.eta_affine(emb)).to(x.dtype).unsqueeze(2).unsqueeze(3) # [B,1,1,1]
+            else:
+                eta_emb = None
+
+            if neuron_steer is not None:
+                for i,noise_emb in enumerate(noise_emb_ls):
+                    _,_,h,w = neuron_steer["a_shape"][i]
+                    noise_emb_ls[i] = noise_emb.repeat(1,1,h,w)
+                    i,j,k = neuron_steer["neuron_idx"]
+                    L = neuron_steer["neuron_level"]
+                    noise_emb_ls[L][:,i,j,k] = noise_emb_ls[L][:,i,j,k]*neuron_steer["steer_value"][0] + neuron_steer["steer_value"][1]
+
+                    
+
         else:
             noise_emb_ls = [self.lambda_bias for _ in range(self.n_levels)]
 
@@ -3700,47 +3910,56 @@ class neural_sheet(nn.Module):
                     x_perm = [x_scale[perm_idx] for x_scale in x]
                     for _ in range(k0):
                         # self.forward_inter(x_perm, a, upstream_grad, noise_emb_ls, T=T)
-                        self.forward_inter(x_perm, a, upstream_grad, decoded, noise_emb_ls, T=T,n_components=n_components,steer_components=steer_components)
+                        self.forward_inter(x_perm, a, upstream_grad, decoded, noise_emb_ls, T=T,n_components=n_components,steer_components=steer_components,eta_emb=eta_emb)
                         
+                history = []
                 for _ in range(n0):
-                    self.forward_inter(x, a, upstream_grad, decoded, noise_emb_ls, T=T,n_components=n_components,steer_components=steer_components)
+                    self.forward_inter(x, a, upstream_grad, decoded, noise_emb_ls, T=T,n_components=n_components,steer_components=steer_components,eta_emb=eta_emb)
+                    if return_history:
+                        a = [ai.detach() if ai is not None else None for ai in a]
+                        upstream_grad = [ui.detach() if isinstance(ui,torch.Tensor) else 0 for ui in upstream_grad]
+                        decoded = [decoded[i].detach().clone() for i in self.injection_dic.keys()]
+                        features =  {"a":a,"decoded":decoded,"upstream_grad":upstream_grad,"denoised":self.decoder(decoded)}
+                        history.append(features)
 
         # cut graph between phases
         a = [ai.detach() if ai is not None else None for ai in a]
 
         # ---- with-grad phase ----
         for _ in range(m1):
-            self.forward_inter(x, a, upstream_grad, decoded, noise_emb_ls,n_components=n_components,steer_components=steer_components)
+            self.forward_inter(x, a, upstream_grad, decoded, noise_emb_ls,n_components=n_components,steer_components=steer_components,eta_emb=eta_emb)
 
         decoded = [decoded[i] for i in self.injection_dic.keys()]
         # return decoded[0].sum(dim=1,keepdim=True)
         if return_feature:
-            a = [ai.detach() if ai is not None else None for ai in a]
-            # print(upstream_grad[0])
-            # check if us is a tensor
-            upstream_grad = [ui.detach() if isinstance(ui,torch.Tensor) else 0 for ui in upstream_grad]
-            return {"a":a,"decoded":decoded,"upstream_grad":upstream_grad,"denoised":self.decoder(decoded)}
+            if return_history:
+                return history
+            else:
+                a = [ai.detach().clone() if ai is not None else None for ai in a]
+                upstream_grad = [ui.detach().clone() if isinstance(ui,torch.Tensor) else 0 for ui in upstream_grad]
+                features =  {"a":a,"decoded":decoded,"upstream_grad":upstream_grad,"denoised":self.decoder(decoded)}
+                return features
         else:
             return self.decoder(decoded)
 
-    def forward_inter(self, x_in, a, upstream_grad, decoded, noise_emb_ls=None, T=0,n_components=None,steer_components=None):
+    def forward_inter(self, x_in, a, upstream_grad, decoded, noise_emb_ls=None, T=0,n_components=None,steer_components=None,eta_emb=None):
         # bottom-up
         for i in range(len(self.levels)):
             # print(i)
             inp = None if i == 0 else a[i - 1]
             top_signal = upstream_grad[i + 1] if i < self.n_levels - 1 else None
             x_c = x_in[self.injection_dic[i]] if i in self.injection_dic else None
-            a[i], upstream_grad[i], decoded[i] = self.levels[i](inp, a_prev=a[i], x_c = x_c, top_signal=top_signal, noise_emb = noise_emb_ls[i], T=T,n_components=n_components,steer_components=steer_components)
+            a[i], upstream_grad[i], decoded[i] = self.levels[i](inp, a_prev=a[i], x_c = x_c, top_signal=top_signal, noise_emb = noise_emb_ls[i], T=T,n_components=n_components,steer_components=steer_components,eta_emb=eta_emb)
 
         # top-down
         for i in range(self.n_levels - 1, -1, -1):
-            
             inp = None if i == 0 else a[i - 1]
             top_signal = upstream_grad[i + 1] if i < self.n_levels - 1 else None
             x_c = x_in[self.injection_dic[i]] if i in self.injection_dic else None
-            # print(x_c)
-            a[i], upstream_grad[i], decoded[i] = self.levels[i](inp, a_prev=a[i], x_c = x_c, top_signal=top_signal, noise_emb = noise_emb_ls[i], T=T,n_components=n_components,steer_components=steer_components)
+            a[i], upstream_grad[i], decoded[i] = self.levels[i](inp, a_prev=a[i], x_c = x_c, top_signal=top_signal, noise_emb = noise_emb_ls[i], T=T,n_components=n_components,steer_components=steer_components,eta_emb=eta_emb)
             
+
+
             # print([d.shape if d is not None else None for d in decoded])
     # def infer(self, x, a = None, decoded = None, noise_labels=None,n_iter = 1,return_feature=False,return_hist =False,T=None):
     #     if T is None:
