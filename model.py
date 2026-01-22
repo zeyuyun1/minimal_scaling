@@ -3480,15 +3480,26 @@ class RecurrentConvNLayer_simple(nn.Module):
         noise_emb = F.relu(self.map_layer0(emb))
         # noise_emb = self.affine(noise_emb).unsqueeze(2).unsqueeze(3).to(x.dtype)  # [B, c1, 1, 1]
         noise_emb = [affine(noise_emb).unsqueeze(2).unsqueeze(3).to(x.dtype) for affine in self.affines]
+
+        # if neuron_steer is not None:
+        #     for i,noise_emb in enumerate(noise_emb_ls):
+        #         _,_,h,w = neuron_steer["a_shape"][i]
+        #         noise_emb_ls[i] = noise_emb.repeat(1,1,h,w)
+        #         i,j,k = neuron_steer["neuron_idx"]
+        #         L = neuron_steer["neuron_level"]
+        #         noise_emb_ls[L][:,i,j,k] = noise_emb_ls[L][:,i,j,k]*neuron_steer["steer_value"][0] + neuron_steer["steer_value"][1]
+
         return noise_emb
 
 
-    def forward(self, x, deq_mode=True, noise_labels = None, class_labels=None,return_feature=False,CFG_scale=0.0):
+    def forward(self, x, deq_mode=True, noise_labels = None, class_labels=None, return_feature=False, CFG_scale=0.0, classic_CFG = False, noise_emb=None):
         B,_,_,_ = x.shape
         # initalize state and label embddings
         a = [None] * self.n_levels
         decoded = [None] * self.n_levels
-        noise_emb = self.get_embedding(x, noise_labels, class_labels)
+        
+        if noise_emb is None:
+            noise_emb = self.get_embedding(x, noise_labels, class_labels)
 
         if CFG_scale > 0.0:
             a_uncond = [None] * self.n_levels
@@ -3502,7 +3513,9 @@ class RecurrentConvNLayer_simple(nn.Module):
                 self.forward_inter(x, a_uncond, decoded_uncond, noise_emb_uncond)
                 for i in range(self.n_levels):
                     a[i] = a[i] + CFG_scale * (a[i] - a_uncond[i])
-                    decoded[i] = decoded[i] + CFG_scale * (decoded[i] - decoded_uncond[i])
+                    # classic CFG?
+                    if classic_CFG:
+                        decoded[i] = decoded[i] + CFG_scale * (decoded[i] - decoded_uncond[i])
 
         if return_feature:
             return a, decoded
@@ -3871,8 +3884,6 @@ class neural_sheet(nn.Module):
                     i,j,k = neuron_steer["neuron_idx"]
                     L = neuron_steer["neuron_level"]
                     noise_emb_ls[L][:,i,j,k] = noise_emb_ls[L][:,i,j,k]*neuron_steer["steer_value"][0] + neuron_steer["steer_value"][1]
-
-                    
 
         else:
             noise_emb_ls = [self.lambda_bias for _ in range(self.n_levels)]
